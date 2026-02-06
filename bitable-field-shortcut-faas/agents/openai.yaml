@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bitable FaaS Shortcut"
+  short_description: "Develop Feishu Bitable field shortcut plugins (FaaS)"
+  default_prompt: "Build or debug Feishu Bitable field shortcut plugins with correct formItems, resultType, execute, auth, and packaging constraints."
