@@ -1,0 +1,4 @@
+interface:
+  display_name: "Aliyun SSH"
+  short_description: "Connect to Alibaba Cloud ECS via local SSH aliases"
+  default_prompt: "Use local SSH aliases to connect, execute commands, and transfer files safely without exposing secrets"
