@@ -1,0 +1,4 @@
+interface:
+  display_name: "Aliyun Auto Deploy"
+  short_description: "Generate robust GitHub Actions deployment to Aliyun ECS"
+  default_prompt: "Use $aliyun-github-actions-deploy to add robust GitHub Actions deployment for this repository."
