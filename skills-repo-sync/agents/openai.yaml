@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skills Repo Sync"
+  short_description: "Validate and sync one local skill folder to shared repo."
+  default_prompt: "Sync this skill folder to my shared skills repository. Validate first, compare with existing folder, apply updates, and show a report."
