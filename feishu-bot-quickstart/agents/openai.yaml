@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feishu Bot Quickstart"
+  short_description: "Scaffold a Feishu long-connection bot."
+  default_prompt: "Scaffold a Feishu long-connection bot service into this repo and explain how to configure the Feishu self-built app and run a local smoke test."
