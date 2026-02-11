@@ -1,7 +1,6 @@
 ---
 name: update-docs
-description: This skill should be used when the user asks to "update documentation for my changes", "check docs for this PR", "what docs need updating", "sync docs with code", "scaffold docs for this feature", "document this feature", "review docs completeness", "add docs for this change", "what documentation is affected", "docs impact", or mentions "docs/", "docs/01-app", "docs/02-pages", "MDX", "documentation update", "API reference", ".mdx files". Provides guided workflow for updating Next.js documentation based on code changes.
-description_zh: 基于代码变更来更新 Next.js 文档的工作流指南。用于判断“哪些文档需要改”、把代码路径映射到 docs/ 下对应文档，并按步骤完成补充与校验。
+description: This skill should be used when the user asks to "update documentation for my changes", "check docs for this PR", "what docs need updating", "sync docs with code", "scaffold docs for this feature", "document this feature", "review docs completeness", "add docs for this change", "what documentation is affected", "docs impact", or mentions "docs/", "docs/01-app", "docs/02-pages", "MDX", "documentation update", "API reference", ".mdx files". Provides guided workflow for updating Next.js documentation based on code changes. 中文说明：根据代码变更判断文档影响面，映射到对应 docs 路径并按流程完成补充与校验。
 ---
 
 # Next.js Documentation Updater

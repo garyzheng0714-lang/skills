@@ -1,7 +1,6 @@
 ---
 name: webapp-testing
-description: Toolkit for interacting with and testing local web applications using Playwright. Supports verifying frontend functionality, debugging UI behavior, capturing browser screenshots, and viewing browser logs.
-description_zh: 使用 Playwright（Python）对本地 Web 应用做自动化测试与调试：启动/管理本地服务、跑 UI 流程、抓截图和控制台日志、定位元素选择器等。
+description: Toolkit for interacting with and testing local web applications using Playwright. Supports verifying frontend functionality, debugging UI behavior, capturing browser screenshots, and viewing browser logs. 中文说明：用 Playwright（Python）对本地 Web 应用做自动化测试与调试（启动服务、跑 UI 流程、抓截图/日志、定位选择器）。
 license: Complete terms in LICENSE.txt
 ---
 

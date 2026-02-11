@@ -5,7 +5,7 @@ description: |
   Use when: building web applications, developing APIs, creating frontends, setting up databases,
   deploying web apps, or when user mentions React, Next.js, Express, REST API, GraphQL, MongoDB,
   PostgreSQL, or full-stack development.
-description_zh: 全栈开发技能集合（React/Next.js + Node.js + 数据库 + 部署）。用于从 0 到 1 搭建 Web 应用、API、数据模型、鉴权与上线流程。
+  中文说明：全栈开发技能集合（React/Next.js + Node.js + 数据库 + 部署），用于从 0 到 1 搭建 Web 应用、API、数据模型、鉴权与上线流程。
 license: MIT
 metadata:
   author: awesome-llm-apps

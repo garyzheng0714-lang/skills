@@ -1,7 +1,6 @@
 ---
 name: frontend-code-review
-description: "Trigger when the user requests a review of frontend files (e.g., `.tsx`, `.ts`, `.js`). Support both pending-change reviews and focused file reviews while applying the checklist rules."
-description_zh: 前端代码审查清单与输出模板。用于 review TS/TSX/JS 代码（按提交变更或指定文件），从代码质量、性能、业务逻辑三类规则给出可执行的修改建议。
+description: "Trigger when the user requests a review of frontend files (e.g., `.tsx`, `.ts`, `.js`). Support both pending-change reviews and focused file reviews while applying the checklist rules. 中文说明：前端代码审查清单与输出模板，用于 review TS/TSX/JS 代码并给出可执行的修改建议（质量/性能/业务逻辑）。"
 ---
 
 # Frontend Code Review
