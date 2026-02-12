@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feishu OAuth Login Setup"
+  short_description: "Guide Feishu OAuth setup and troubleshooting"
+  default_prompt: "Collect Feishu app config, guide OAuth setup step-by-step, and troubleshoot login errors."
