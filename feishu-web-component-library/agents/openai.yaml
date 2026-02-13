@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feishu Web Component Library"
+  short_description: "Build web UIs aligned with Feishu design system standards"
+  default_prompt: "Use Feishu web component standards, tokens, and interaction rules to design and implement UI."

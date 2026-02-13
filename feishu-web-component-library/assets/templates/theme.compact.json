@@ -1,0 +1,26 @@
+{
+  "name": "feishu-compact-light",
+  "extends": "theme.default.json",
+  "density": "compact",
+  "spacing": {
+    "base": 8,
+    "fine": 4,
+    "rowPadding.table": 8,
+    "rowPadding.list": 8,
+    "formGap": 20
+  },
+  "componentOverrides": {
+    "Button": {
+      "defaultSize": "sm"
+    },
+    "Input": {
+      "defaultSize": "sm"
+    },
+    "Table": {
+      "defaultDensity": "compact"
+    },
+    "Pagination": {
+      "size": "sm"
+    }
+  }
+}
