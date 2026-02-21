@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feishu Sidebar Builder"
+  short_description: "Build robust Feishu Bitable sidebar plugins fast."
+  default_prompt: "Use $feishu-bitable-sidebar-plugin to build or debug a Bitable sidebar plugin with fixed-width UX and health checks."

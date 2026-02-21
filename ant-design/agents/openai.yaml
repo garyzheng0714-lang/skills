@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ant Design Repo Assistant"
+  short_description: "Build and contribute in ant-design repo fast"
+  default_prompt: "Use $ant-design to implement or modify Ant Design components with proper demos, tests, and docs."
