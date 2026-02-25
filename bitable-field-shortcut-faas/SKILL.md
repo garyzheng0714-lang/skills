@@ -1,6 +1,6 @@
 ---
 name: bitable-field-shortcut-faas
-description: Build, debug, and release Feishu/Lark Bitable field shortcut plugins (FaaS). Use when tasks involve basekit.addField, formItems, resultType, execute, context.fetch, authorization modes, domain whitelist, logID-based debugging, local debug helper, npm run pack, or runtime constraints for 多维表格 字段捷径.
+description: Build, debug, and release Feishu/Lark Bitable field shortcut plugins (FaaS). Use when tasks involve basekit.addField, formItems, resultType, execute, context.fetch, authorization modes, domain whitelist, logID-based debugging, local debug helper, local port 8080 startup for testing, optional npm run pack, or runtime constraints for 多维表格 字段捷径.
 ---
 
 # Bitable Field Shortcut FaaS
@@ -13,7 +13,8 @@ description: Build, debug, and release Feishu/Lark Bitable field shortcut plugin
 4. Add network whitelist and optional authorization config before calling external APIs.
 5. Add deterministic logs that always include `context.logID`.
 6. Validate behavior with the local debug assistant.
-7. Package with `npm run pack` and release with compatibility checks.
+7. Before ending the task, ensure a local debug service is running on port `8080` for user testing.
+8. Package with `npm run pack` only when the user explicitly requests packaging/release.
 
 Use this order unless the user explicitly asks for partial work.
 
@@ -42,7 +43,8 @@ Use this order unless the user explicitly asks for partial work.
 
 1. Follow `references/quickstart.md` for local startup and debug helper flow.
 2. Follow `references/limits-and-ops.md` for queue, rate, async/sync, and update compatibility.
-3. Package only with `npm run pack`; do not hand-edit zip contents.
+3. Default behavior: do not run `npm run pack` unless the user asks for packaging.
+4. If packaging is requested, package only with `npm run pack`; do not hand-edit zip contents.
 
 ## References
 

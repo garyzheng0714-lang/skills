@@ -15,6 +15,12 @@ npm run start
 
 4. Keep entry layout unchanged, especially `src/index.ts`.
 
+## End-of-Task Defaults
+
+1. Before ending the task, keep the local debug service running on port `8080` so the user can test immediately.
+2. If the service is not running, start it with `npm run start`.
+3. Do not run `npm run pack` unless the user explicitly asks for packaging/release.
+
 ## Build Core Field
 
 1. Define `formItems` for user inputs.
@@ -42,7 +48,7 @@ Use these debug constraints:
 
 ## Package and Release
 
-1. Package only with:
+1. If the user explicitly requests packaging, package only with:
 
 ```bash
 npm run pack
