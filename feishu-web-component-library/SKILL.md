@@ -1,6 +1,6 @@
 ---
 name: feishu-web-component-library
-description: Build or refactor web UI component libraries to align with Feishu (Lark) design specifications, including design principles, component definitions, visual tokens, interaction rules, responsive behavior, accessibility, internationalization, and version governance. Use when tasks involve Feishu-style buttons, inputs, tables, dialogs, navigation, cards, lists, pagination, loading, tooltip/notice, charts, or when creating reusable component contracts, theme configs, tests, and integration docs.
+description: Build or refactor web UI component libraries to align with Feishu (Lark) design specifications, including design principles, component definitions, visual tokens, interaction rules, responsive behavior, accessibility, internationalization, and version governance. Use when tasks involve Feishu-style buttons, inputs, tables, dialogs, navigation, cards, lists, pagination, loading, tooltip/notice, charts, or when creating reusable component contracts, theme configs, tests, and integration docs. Also use when adapting frontend UI work inside an existing project codebase (especially short-url style projects with `client/src/components/ui` and `client/src/components/business-ui`) while preserving local component reuse and theme files.
 ---
 
 # Feishu Web Component Library
@@ -8,6 +8,7 @@ description: Build or refactor web UI component libraries to align with Feishu (
 ## Overview
 
 Use this skill to convert Feishu design specification documents into an implementable, reusable web component-library standard.
+Use this skill also to adapt Feishu-style UI work into an existing codebase without breaking the local component hierarchy, routing, and theme/token setup.
 
 This skill is optimized for:
 - Component-library architecture and API contracts
@@ -32,7 +33,69 @@ If missing, assume:
 - Breakpoints: XS/S/M/L/XL
 - Theme: light
 
-## Source Coverage Workflow
+## Existing Project Integration Workflow (short-url aware)
+
+Run this section first when the task is inside an existing frontend project or a provided project zip snapshot.
+
+### 1. Detect the source to inspect
+
+- Prefer workspace source when `client/src` exists.
+- If the frontend source is only available as a zip snapshot (for example `/Users/simba/Downloads/app_4jk48fgjse88g.zip`), inspect the zip directly.
+- When reading from the zip, use leading-slash entry paths (example: `/client/src/app.tsx`).
+
+```bash
+zipinfo -1 /Users/simba/Downloads/app_4jk48fgjse88g.zip | rg '^/client/src/'
+unzip -p /Users/simba/Downloads/app_4jk48fgjse88g.zip /client/src/app.tsx | sed -n '1,160p'
+```
+
+### 2. Read the project UI source-of-truth files before designing
+
+Read these files first (workspace or zip snapshot equivalent):
+
+- `client/index.html` (shell + mount node)
+- `client/src/index.tsx` (bootstrap, `AppContainer`, global CSS import, error boundary)
+- `client/src/app.tsx` (route wiring and active page selection)
+- `client/src/components/Layout.tsx` (root layout shell)
+- `client/src/index.css` (global imports)
+- `client/src/tailwind-theme.css` (project tokens)
+- `client/src/typography.css` (typography rules)
+- `client/src/pages/*` (actual routed pages)
+
+### 3. Reuse local components before introducing new patterns
+
+Prefer this order:
+
+1. Rewire an existing page/route (`client/src/app.tsx`, `client/src/pages/*`)
+2. Reuse `client/src/components/business-ui/*` (domain-specific UI)
+3. Reuse `client/src/components/ui/*` (primitives)
+4. Reuse toolkit wrappers/components already present in the app (for example `@lark-apaas/client-toolkit`)
+5. Create a new local component only when no suitable candidate exists
+
+For the analyzed short-url snapshot (`app_4jk48fgjse88g.zip`):
+
+- `client/src/components/ui` contains 79 `.ts/.tsx/.css` files
+- `client/src/components/business-ui` contains 93 `.ts/.tsx/.css` files
+- `client/src/pages` contains 2 page files
+
+### 4. Preserve project visual consistency first, then apply Feishu refinements
+
+- Preserve project theme tokens from `client/src/tailwind-theme.css`
+- Preserve typography rules from `client/src/typography.css`
+- Preserve root theme container usage from `client/src/index.tsx` (for example `AppContainer defaultTheme`)
+- Preserve root layout constraints from `client/src/components/Layout.tsx` (for example `w-screen h-screen`) unless the task requires structural changes
+- Apply Feishu component and interaction rules as a refinement layer, not a replacement of the local design system
+
+### 5. Record current route/page reality before editing
+
+For the analyzed short-url snapshot:
+
+- Home/index route currently renders toolkit `Welcome`
+- `client/src/pages/ExamplePage/ExamplePage.tsx` exists but is fully commented out and not mounted
+- `client/src/pages/NotFound/NotFound.tsx` is a thin wrapper around toolkit `NotFoundRender`
+
+## Feishu Source Coverage Workflow
+
+Run this after the existing-project audit above (or first if there is no local project code to align with).
 
 Always execute in this order:
 
@@ -77,6 +140,7 @@ python3 scripts/generate_react_skeleton_from_contract.py \
 
 ### Step 3: Generate or Refactor UI Code
 - Apply component contracts first, style tokens second, interaction details third
+- In existing codebases, map the contracts onto local components and file structure before introducing new primitives
 - For responsive behavior, map from desktop patterns to S/XS collapses instead of naive shrinking
 - For i18n, avoid fixed-width text assumptions and prefer layout adaptation
 
@@ -145,6 +209,7 @@ When generating a reusable component-library result, always output:
 ## Guardrails
 
 - Preserve Feishu semantic layering; do not flatten all components into one generic style.
+- In existing projects, reuse local `business-ui` and `ui` components before creating new Feishu-style primitives.
 - Do not mix multiple unrelated visual styles in one same-priority action group.
 - Prioritize readability and operation clarity over decorative style.
 - Prefer layout adaptation over text truncation in i18n.
