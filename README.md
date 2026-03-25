@@ -4,36 +4,6 @@
 
 本仓库用于集中存放可复用的 Codex Skills，支持多设备同步与版本管理。
 
-## 同步更新报告（2026-02-21）
-
-本次从本地技能库 `~/.codex/skills` 对比同步到仓库，重点处理：
-
-- 补齐缺失 skill：`ant-design`、`feishu-bitable-sidebar-plugin`
-- 整理 README（同步报告、日志记录、各 skill 中文介绍）
-
-## 日志与排障记录
-
-### 1) 同步日志目录
-
-- `/tmp/skill-sync-reports`
-- `/tmp/skill-sync-dry-summary.txt`
-- `/tmp/skill-sync-commit-summary.txt`
-
-常见日志文件类型：
-
-- `*-dry.md` / `*-dry.json` / `*-dry.stdout`
-- `*-apply.md` / `*-apply.json` / `*-apply.stdout`
-- `*-commit.stdout`
-
-### 2) 关键问题与处理
-
-1. SSH 22 端口被拦截
-   - 现象：`Connection closed by ... port 22`
-   - 处理：GitHub SSH 改为 443（`ssh.github.com`）
-2. 推送被拒绝（远端领先）
-   - 现象：`[rejected] main -> main (fetch first)`
-   - 处理：先 `fetch`/`rebase`，或基于 `origin/main` 新建干净分支后推送
-
 ## Skills 中文介绍
 
 | Skill | 中文介绍 |
@@ -41,18 +11,25 @@
 | `aliyun-github-actions-deploy` | 为 Node Web/API 项目提供 GitHub Actions 自动部署到阿里云 ECS 的标准化方案（含 PM2 与健康检查）。 |
 | `aliyun-ssh` | 提供阿里云 ECS 的 SSH 连接、远程命令执行、文件传输与安全配置能力。 |
 | `ant-design` | 面向 Ant Design 项目与组件开发的实现、修复、文档与测试协同工作流。 |
-| `bitable-field-shortcut-faas` | 飞书多维表格“字段捷径（FaaS）”插件开发与发布能力。 |
+| `bitable-field-shortcut-faas` | 飞书多维表格”字段捷径（FaaS）”插件开发与发布能力。 |
 | `feishu-base-parser` | 解析飞书多维表格 `.base` 文件，输出业务结构与逻辑文档。 |
-| `feishu-bitable-sidebar-plugin` | 飞书多维表格“边栏插件”开发专用能力，覆盖变量提取、字段绑定、固定宽度布局和端口排障。 |
+| `feishu-bitable-sidebar-plugin` | 飞书多维表格”边栏插件”开发专用能力，覆盖变量提取、字段绑定、固定宽度布局和端口排障。 |
 | `feishu-bot-quickstart` | 快速搭建飞书机器人（长连接）并完成鉴权、收发消息与排障。 |
 | `feishu-oauth-login-setup` | 飞书 OAuth 登录配置与问题定位（redirect_uri、回调、环境变量等）。 |
 | `feishu-web-component-library` | 按飞书官方风格规范构建 Web 界面与组件。 |
+| `ffmpeg-video-editor` | 将自然语言视频编辑请求转换为 FFmpeg 命令（剪切、转码、压缩、变速、提取音频等）。 |
 | `find-skills` | 搜索、发现并安装可用 skills。 |
 | `frontend-code-review` | 前端代码审查清单与输出模板（质量/性能/业务逻辑）。 |
 | `frontend-design` | 高质量前端视觉与交互实现，强调可用性与差异化。 |
 | `fullstack-developer` | 全栈开发能力（React/Next.js + Node.js + 数据库 + API + 部署）。 |
+| `ljg-paper` | 学术论文阅读与分析（拆结构、榨增量、白话方法、费曼讲解、博导审稿），输出连贯的 Org-mode 解读文档。 |
+| `playwright-interactive` | 通过持久化 js_repl 会话驱动 Playwright，进行 Web 和 Electron 应用的交互式 UI 调试与 QA。 |
+| `react-best-practices` | React/Next.js 性能优化最佳实践（来自 Vercel），涵盖 57 条规则与 8 大类别。 |
+| `skill-creator` | 创建或更新 Codex Skill 的指导流程（规划、初始化、编辑、验证）。 |
+| `skill-installer` | 从 openai/skills 精选列表或其他 GitHub 仓库安装 Codex Skill。 |
 | `skills-repo-sync` | 本地与仓库技能目录的校验、diff、同步、报告生成与推送流程。 |
 | `update-docs` | 根据代码变化识别文档影响面并更新文档。 |
+| `web-design-guidelines` | 按 Web Interface Guidelines 审查 UI 代码的可用性与无障碍合规性。 |
 | `webapp-testing` | 使用 Playwright 对本地 Web 应用进行自动化测试、截图与日志采集。 |
 
 ## 使用建议
