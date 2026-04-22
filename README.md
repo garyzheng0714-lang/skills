@@ -31,6 +31,7 @@
 | `update-docs` | 根据代码变化识别文档影响面并更新文档。 |
 | `web-design-guidelines` | 按 Web Interface Guidelines 审查 UI 代码的可用性与无障碍合规性。 |
 | `webapp-testing` | 使用 Playwright 对本地 Web 应用进行自动化测试、截图与日志采集。 |
+| `zzh-feishu-card-table-handler` | 根据入参 + 期望输出自动生成飞书消息卡片表格所需的 `handler(input)` JavaScript 代码,自动推断字段映射(拼音/中文/英文),覆盖 4 种入参形状与飞书字段取值结构。 |
 
 ## 使用建议
 
