@@ -1,0 +1,96 @@
+// 飞书登录入口组件（React + TypeScript）
+//
+// 用法：
+//   import { FeishuLoginButton, useCurrentUser, requireLogin } from './lib/feishuLogin';
+//
+//   // 登录页：
+//   <FeishuLoginButton />
+//
+//   // 受保护路由（任何需要登录的页面）：
+//   const user = useCurrentUser();
+//   if (!user) requireLogin(); return null;
+//
+// 后端约定：
+//   - GET /auth/feishu/login → 后端 302 跳飞书授权页
+//   - GET /api/me            → 返当前登录用户 {name, email, avatar}，未登录返 401
+
+import React, { useEffect, useState } from 'react';
+
+const LOGIN_URL = '/auth/feishu/login';
+const ME_URL = '/api/me';
+
+export interface CurrentUser {
+  name: string;
+  email?: string;
+  avatar_url?: string;
+}
+
+/** 跳飞书登录页（清空当前会话状态再跳） */
+export function requireLogin(): void {
+  window.location.href = LOGIN_URL;
+}
+
+/** 飞书登录按钮（点击后浏览器跳后端 → 后端 302 跳飞书授权页） */
+export function FeishuLoginButton(props: { className?: string; children?: React.ReactNode }) {
+  return (
+    <a
+      href={LOGIN_URL}
+      className={props.className ?? 'feishu-login-btn'}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 8,
+        padding: '10px 20px',
+        background: '#3370FF',
+        color: '#fff',
+        borderRadius: 4,
+        textDecoration: 'none',
+        fontWeight: 500,
+      }}
+    >
+      {props.children ?? '使用飞书登录'}
+    </a>
+  );
+}
+
+/** 拿当前登录用户。未登录返 null。 */
+export function useCurrentUser(): CurrentUser | null | undefined {
+  // undefined = 还在加载；null = 加载完但未登录；CurrentUser = 已登录
+  const [user, setUser] = useState<CurrentUser | null | undefined>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(ME_URL, { credentials: 'include' })
+      .then((res) => {
+        if (cancelled) return;
+        if (res.status === 401) {
+          setUser(null);
+          return null;
+        }
+        return res.json();
+      })
+      .then((data) => {
+        if (cancelled || !data) return;
+        setUser(data);
+      })
+      .catch(() => {
+        if (!cancelled) setUser(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return user;
+}
+
+/** 高阶：包一层路由，未登录自动跳登录页 */
+export function RequireAuth({ children }: { children: React.ReactNode }) {
+  const user = useCurrentUser();
+  if (user === undefined) return <div>Loading...</div>; // 别在这里判断 user，否则 race
+  if (user === null) {
+    requireLogin();
+    return null;
+  }
+  return <>{children}</>;
+}

@@ -1,0 +1,26 @@
+{
+  "skill_name": "feishu-login-guide",
+  "evals": [
+    {
+      "id": 1,
+      "name": "go-empty-project-from-zero",
+      "prompt": "我想给我的 Go 项目加飞书扫码登录，从零开始。我现在还没在飞书开放平台创建任何应用。一步步教我吧。",
+      "expected_output": "skill 应该启动逐步问答流程：先确认场景（默认 OAuth 跳转，因为用户说扫码可能是误称——要验证）、确认技术栈（Go），然后从阶段 1（创建应用）开始，引导用户去 https://open.feishu.cn/app 操作并回报 App ID。绝不能一次倒出全部 5 阶段，绝不能在拿到 App ID 之前先写代码。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "react-frontend-existing-backend",
+      "prompt": "我后端已经有 Express 服务跑在 :3000，前端是 React + Vite。我已经在飞书后台创建了应用，App ID 是 cli_a1b2c3d4e5f6g7h8。现在想把飞书登录接到这套上面。",
+      "expected_output": "skill 应跳过阶段 1（用户已完成），从阶段 2 开始确认是否配过回调 URL 白名单，然后讲阶段 3 的 token 流，阶段 4 给 Express 模板（节点端口要按 3000 调整），阶段 5 给 React 模板。仍然分阶段推进，不要一次给全部代码。模板里的 redirect_uri 占位符要正确替换成 http://localhost:3000/auth/feishu/callback（除非用户另说）。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "stuck-on-4401-error",
+      "prompt": "我按你之前教的接入了飞书登录，但点登录跳到飞书页报「4401 应用暂不可用」。代码我都按模板写好了，App ID 也是对的。怎么办？",
+      "expected_output": "skill 应立即引导到 references/error-codes.md 的「请求非法 / 4401」条目，提示 99% 是 redirect_uri 没配白名单或字符级不一致。具体动作：让用户对比代码里的 REDIRECT_URI 常量和飞书后台 → 安全设置 → 重定向 URL 列表，逐字符对照（斜杠、http/https、端口、大小写）。不应让用户先怀疑代码逻辑、不应建议改代码。",
+      "files": []
+    }
+  ]
+}

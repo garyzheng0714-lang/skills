@@ -1,0 +1,169 @@
+"""
+飞书 OAuth 登录处理（FastAPI）
+
+占位符：
+  {{APP_ID}}        → 飞书 App ID（cli_xxx）
+  {{REDIRECT_URI}}  → 回调 URL，与开放平台白名单字符级一致
+
+使用：
+  from fastapi import FastAPI
+  from app.middleware.feishu_oauth import feishu_router
+  app = FastAPI()
+  app.include_router(feishu_router)
+
+环境变量：FEISHU_APP_SECRET（必须）
+"""
+
+import os
+import secrets
+from typing import Optional
+from urllib.parse import urlencode
+
+import httpx
+from fastapi import APIRouter, Request, Response, HTTPException
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+
+APP_ID = "{{APP_ID}}"
+REDIRECT_URI = "{{REDIRECT_URI}}"
+AUTHORIZE_URL = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
+TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
+USER_INFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
+STATE_COOKIE = "feishu_oauth_state"
+STATE_TTL = 600  # 10 分钟
+
+
+class FeishuUser(BaseModel):
+    open_id: str
+    union_id: str
+    user_id: Optional[str] = None
+    name: str
+    en_name: Optional[str] = None
+    avatar_url: str
+    email: Optional[str] = None
+    mobile: Optional[str] = None
+    tenant_key: str
+
+
+feishu_router = APIRouter(prefix="/auth/feishu")
+
+
+@feishu_router.get("/login")
+async def login(request: Request):
+    state = secrets.token_urlsafe(24)
+
+    params = {
+        "client_id": APP_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "state": state,
+    }
+    response = RedirectResponse(url=f"{AUTHORIZE_URL}?{urlencode(params)}")
+    response.set_cookie(
+        key=STATE_COOKIE,
+        value=state,
+        max_age=STATE_TTL,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+        path="/auth/feishu",
+    )
+    return response
+
+
+@feishu_router.get("/callback")
+async def callback(request: Request, code: Optional[str] = None,
+                   state: Optional[str] = None, error: Optional[str] = None,
+                   error_description: Optional[str] = None):
+    # 1. 核对 state（不一致直接 403）
+    state_cookie = request.cookies.get(STATE_COOKIE)
+    if not state_cookie or state_cookie != state:
+        raise HTTPException(status_code=403, detail="state mismatch")
+
+    # 2. 处理用户拒绝
+    if error:
+        print(f"feishu authorize denied: {error} - {error_description}")
+        resp = RedirectResponse(url="/login?error=denied")
+        resp.delete_cookie(STATE_COOKIE, path="/auth/feishu")
+        return resp
+
+    if not code:
+        raise HTTPException(status_code=400, detail="missing code")
+
+    try:
+        # 3. code 换 token
+        token = await exchange_code_for_token(code)
+
+        # 4. 拿用户信息
+        user = await fetch_user_info(token)
+
+        # 5. upsert 本地用户、建 session
+        local_id = await upsert_local_user(user)
+        resp = RedirectResponse(url="/")
+        resp.delete_cookie(STATE_COOKIE, path="/auth/feishu")
+        create_session(resp, local_id)
+        return resp
+    except Exception as e:
+        print(f"feishu callback failed: {e}")
+        raise HTTPException(status_code=500, detail="login failed")
+
+
+async def exchange_code_for_token(code: str) -> str:
+    secret = os.getenv("FEISHU_APP_SECRET")
+    if not secret:
+        raise RuntimeError("FEISHU_APP_SECRET not set")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            TOKEN_URL,
+            json={
+                "grant_type": "authorization_code",
+                "client_id": APP_ID,
+                "client_secret": secret,
+                "code": code,
+                "redirect_uri": REDIRECT_URI,  # 必须与授权时一致
+            },
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+    data = resp.json()
+    if data.get("code") != 0 or not data.get("access_token"):
+        # ⚠️ 不要把 secret/token 写日志
+        raise RuntimeError(f"token api error code={data.get('code')} desc={data.get('error_description')}")
+    return data["access_token"]
+
+
+async def fetch_user_info(token: str) -> FeishuUser:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            USER_INFO_URL,
+            headers={"Authorization": f"Bearer {token}"},  # ⚠️ Bearer 后必须有空格
+        )
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"user_info api error code={data.get('code')} msg={data.get('msg')}")
+    return FeishuUser(**data["data"])
+
+
+# ---- 下面两个函数你需要按自己应用替换实现 ----
+
+async def upsert_local_user(u: FeishuUser) -> str:
+    """按 u.open_id 在 users 表 upsert，返回本地 user id"""
+    # TODO: 按你的 ORM/DB 实现
+    # 示例（SQLAlchemy）：
+    #   user = await db.scalar(select(User).where(User.feishu_open_id == u.open_id))
+    #   if not user:
+    #       user = User(feishu_open_id=u.open_id, name=u.name, email=u.email)
+    #       db.add(user); await db.commit()
+    #   return str(user.id)
+    return u.open_id  # ← 占位
+
+
+def create_session(response: Response, local_user_id: str) -> None:
+    """设你自己的 session cookie"""
+    # TODO:
+    # response.set_cookie(
+    #     key="session", value=sign_session(local_user_id),
+    #     httponly=True, secure=True, samesite="lax",
+    #     max_age=7 * 86400, path="/",
+    # )
+    pass

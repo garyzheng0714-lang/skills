@@ -1,0 +1,153 @@
+// 飞书 OAuth 登录处理（Express + TypeScript）
+//
+// 占位符：
+//   {{APP_ID}}        → 飞书 App ID（cli_xxx）
+//   {{REDIRECT_URI}}  → 回调 URL，与开放平台白名单字符级一致
+//
+// 使用：
+//   import { feishuRouter } from './middleware/feishuOauth';
+//   app.use(cookieParser());          // 需要 cookie-parser
+//   app.use('/auth/feishu', feishuRouter);
+//
+// 环境变量：FEISHU_APP_SECRET（必须）
+
+import { Router, Request, Response } from 'express';
+import { randomBytes } from 'crypto';
+
+const APP_ID = '{{APP_ID}}';
+const REDIRECT_URI = '{{REDIRECT_URI}}';
+const AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
+const TOKEN_URL = 'https://open.feishu.cn/open-apis/authen/v2/oauth/token';
+const USER_INFO_URL = 'https://open.feishu.cn/open-apis/authen/v1/user_info';
+const STATE_COOKIE = 'feishu_oauth_state';
+const STATE_TTL_MS = 10 * 60 * 1000;
+
+interface FeishuUser {
+  open_id: string;
+  union_id: string;
+  user_id?: string;
+  name: string;
+  en_name?: string;
+  avatar_url: string;
+  email?: string;
+  mobile?: string;
+  tenant_key: string;
+}
+
+export const feishuRouter = Router();
+
+feishuRouter.get('/login', (req: Request, res: Response) => {
+  const state = randomBytes(24).toString('base64url');
+
+  // HttpOnly + SameSite=Lax 让 OAuth 回调能带回 cookie
+  res.cookie(STATE_COOKIE, state, {
+    httpOnly: true,
+    secure: req.secure,
+    sameSite: 'lax',
+    path: '/auth/feishu',
+    maxAge: STATE_TTL_MS,
+  });
+
+  const params = new URLSearchParams({
+    client_id: APP_ID,
+    redirect_uri: REDIRECT_URI,
+    response_type: 'code',
+    state,
+  });
+  res.redirect(`${AUTHORIZE_URL}?${params.toString()}`);
+});
+
+feishuRouter.get('/callback', async (req: Request, res: Response) => {
+  // 1. 核对 state（不一致直接 403，绝不"宽容"）
+  const stateCookie = req.cookies?.[STATE_COOKIE];
+  if (!stateCookie || stateCookie !== req.query.state) {
+    return res.status(403).send('state mismatch');
+  }
+  res.clearCookie(STATE_COOKIE, { path: '/auth/feishu' });
+
+  // 2. 处理用户拒绝
+  if (req.query.error) {
+    console.log('feishu authorize denied:', req.query.error, req.query.error_description);
+    return res.redirect('/login?error=denied');
+  }
+
+  const code = req.query.code as string;
+  if (!code) return res.status(400).send('missing code');
+
+  try {
+    // 3. code 换 token
+    const token = await exchangeCodeForToken(code);
+
+    // 4. 拿用户信息
+    const user = await fetchUserInfo(token);
+
+    // 5. upsert 本地用户、建 session
+    const localUserID = await upsertLocalUser(user);
+    createSession(res, localUserID);
+
+    res.redirect('/');
+  } catch (err) {
+    console.error('feishu callback failed:', (err as Error).message);
+    res.status(500).send('login failed');
+  }
+});
+
+async function exchangeCodeForToken(code: string): Promise<string> {
+  const secret = process.env.FEISHU_APP_SECRET;
+  if (!secret) throw new Error('FEISHU_APP_SECRET not set');
+
+  const resp = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({
+      grant_type: 'authorization_code',
+      client_id: APP_ID,
+      client_secret: secret,
+      code,
+      redirect_uri: REDIRECT_URI, // 必须与授权时一致
+    }),
+  });
+  const data = (await resp.json()) as {
+    code: number;
+    access_token?: string;
+    error_description?: string;
+  };
+  if (data.code !== 0 || !data.access_token) {
+    throw new Error(`token api error code=${data.code} desc=${data.error_description}`);
+  }
+  return data.access_token;
+}
+
+async function fetchUserInfo(token: string): Promise<FeishuUser> {
+  const resp = await fetch(USER_INFO_URL, {
+    headers: { Authorization: `Bearer ${token}` }, // ⚠️ Bearer 后必须有空格
+  });
+  const data = (await resp.json()) as { code: number; msg: string; data: FeishuUser };
+  if (data.code !== 0) {
+    throw new Error(`user_info api error code=${data.code} msg=${data.msg}`);
+  }
+  return data.data;
+}
+
+// ---- 下面两个函数你需要按自己应用替换实现 ----
+
+async function upsertLocalUser(u: FeishuUser): Promise<string> {
+  // TODO: 按 u.open_id 在 users 表 upsert，返回本地 user id
+  // 示例：
+  //   const existing = await db.query('SELECT id FROM users WHERE feishu_open_id = $1', [u.open_id]);
+  //   if (existing.rows.length) return existing.rows[0].id;
+  //   const inserted = await db.query(
+  //     'INSERT INTO users(feishu_open_id, name, email) VALUES($1,$2,$3) RETURNING id',
+  //     [u.open_id, u.name, u.email]
+  //   );
+  //   return inserted.rows[0].id;
+  return u.open_id; // ← 占位，仅联调用
+}
+
+function createSession(res: Response, localUserID: string): void {
+  // TODO: 设你自己的 session cookie
+  // res.cookie('session', signSession(localUserID), {
+  //   httpOnly: true, secure: true, sameSite: 'lax',
+  //   maxAge: 7 * 86400 * 1000,
+  // });
+}
