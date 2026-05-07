@@ -11,7 +11,9 @@
   app = FastAPI()
   app.include_router(feishu_router)
 
-环境变量：FEISHU_APP_SECRET（必须）
+环境变量：
+  FEISHU_APP_SECRET            必填。App Secret
+  FEISHU_ALLOWED_TENANT_KEYS   选填。逗号分隔白名单，限制只允许这些企业登录
 """
 
 import os
@@ -97,7 +99,14 @@ async def callback(request: Request, code: Optional[str] = None,
         # 4. 拿用户信息
         user = await fetch_user_info(token)
 
-        # 5. upsert 本地用户、建 session
+        # 5. tenant_key 白名单兜底（飞书后台"应用可用范围"是第一道防线）
+        if not is_allowed_tenant(user.tenant_key):
+            print(f"login denied: tenant_key {user.tenant_key!r} not allowed")
+            resp = RedirectResponse(url="/login?error=unauthorized_tenant")
+            resp.delete_cookie(STATE_COOKIE, path="/auth/feishu")
+            return resp
+
+        # 6. upsert 本地用户、建 session
         local_id = await upsert_local_user(user)
         resp = RedirectResponse(url="/")
         resp.delete_cookie(STATE_COOKIE, path="/auth/feishu")
@@ -130,6 +139,14 @@ async def exchange_code_for_token(code: str) -> str:
         # ⚠️ 不要把 secret/token 写日志
         raise RuntimeError(f"token api error code={data.get('code')} desc={data.get('error_description')}")
     return data["access_token"]
+
+
+def is_allowed_tenant(tenant_key: str) -> bool:
+    """检查 tenant_key 是否在白名单内。未配置 = 不限制。"""
+    allowed = os.getenv("FEISHU_ALLOWED_TENANT_KEYS", "")
+    if not allowed:
+        return True
+    return tenant_key in {k.strip() for k in allowed.split(",")}
 
 
 async def fetch_user_info(token: str) -> FeishuUser:

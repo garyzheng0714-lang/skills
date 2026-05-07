@@ -9,7 +9,9 @@
 //   app.use(cookieParser());          // 需要 cookie-parser
 //   app.use('/auth/feishu', feishuRouter);
 //
-// 环境变量：FEISHU_APP_SECRET（必须）
+// 环境变量：
+//   FEISHU_APP_SECRET            必填。App Secret
+//   FEISHU_ALLOWED_TENANT_KEYS   选填。逗号分隔白名单，限制只允许这些企业登录
 
 import { Router, Request, Response } from 'express';
 import { randomBytes } from 'crypto';
@@ -81,7 +83,13 @@ feishuRouter.get('/callback', async (req: Request, res: Response) => {
     // 4. 拿用户信息
     const user = await fetchUserInfo(token);
 
-    // 5. upsert 本地用户、建 session
+    // 5. tenant_key 白名单兜底（飞书后台"应用可用范围"是第一道防线）
+    if (!isAllowedTenant(user.tenant_key)) {
+      console.log(`login denied: tenant_key ${user.tenant_key} not allowed`);
+      return res.redirect('/login?error=unauthorized_tenant');
+    }
+
+    // 6. upsert 本地用户、建 session
     const localUserID = await upsertLocalUser(user);
     createSession(res, localUserID);
 
@@ -116,6 +124,12 @@ async function exchangeCodeForToken(code: string): Promise<string> {
     throw new Error(`token api error code=${data.code} desc=${data.error_description}`);
   }
   return data.access_token;
+}
+
+function isAllowedTenant(tenantKey: string): boolean {
+  const allowed = process.env.FEISHU_ALLOWED_TENANT_KEYS;
+  if (!allowed) return true; // 未配置 = 不限制
+  return allowed.split(',').map((s) => s.trim()).includes(tenantKey);
 }
 
 async function fetchUserInfo(token: string): Promise<FeishuUser> {

@@ -4,67 +4,104 @@
 
 `src/lib/feishuLogin.tsx`
 
+## 部署 FBIF logo（重要！必做）
+
+模板里 `<FbifLogo />` 通过 `<img src="/fbif-logo.webp" />` 加载 logo。要让浏览器能拿到，需要：
+
+```bash
+# 把 skill 自带的 logo 拷到项目的 public/ 目录
+cp /Users/simba/.claude/skills/feishu-login-guide/assets/fbif-logo.webp <project>/public/fbif-logo.webp
+```
+
+Vite/Next.js/Create React App 都默认把 `public/` 内的文件挂在根路径上，所以浏览器请求 `/fbif-logo.webp` 能拿到。
+
+如果项目用的不是 `public/`（如 Astro 用 `public/`，11ty 用 `_site/`），按项目约定放到对应静态资源目录。
+
 ## 用法
 
-### 登录页
+### A. 整页登录（推荐 — 默认）
 
 ```tsx
-import { FeishuLoginButton } from './lib/feishuLogin';
+// src/pages/Login.tsx
+import { FeishuLoginPage } from '../lib/feishuLogin';
 
-export function LoginPage() {
-  return (
-    <div>
-      <h1>登录</h1>
-      <FeishuLoginButton />
-    </div>
-  );
+export default function LoginPage() {
+  return <FeishuLoginPage />;
+  // 默认文案是 FBIF 项目专用，如要复用：
+  // <FeishuLoginPage appName="XXX" subtitle="..." cardSubtitle="..." />
 }
 ```
 
-### 受保护路由
+### B. 受保护路由
 
 ```tsx
-import { RequireAuth } from './lib/feishuLogin';
+import { RequireAuth } from '../lib/feishuLogin';
 
-<RequireAuth>
+<RequireAuth loginPath="/login">
   <Dashboard />
 </RequireAuth>
 ```
 
-### 顶栏显示当前用户
+### C. 顶栏当前用户
 
 ```tsx
-import { useCurrentUser } from './lib/feishuLogin';
+import { FeishuUserBadge, useCurrentUser } from '../lib/feishuLogin';
 
 function Header() {
   const user = useCurrentUser();
-  if (!user) return <a href="/auth/feishu/login">登录</a>;
-  return <span>欢迎，{user.name}</span>;
+  return (
+    <nav>
+      ...
+      {user ? <FeishuUserBadge /> : <a href="/login">登录</a>}
+    </nav>
+  );
 }
 ```
 
-## 后端约定
+### D. 按钮（自定义页用）
 
-模板假设后端实现了一个 `/api/me`，返回 JSON：
+```tsx
+import { FeishuLoginButton } from '../lib/feishuLogin';
 
+<FeishuLoginButton size="lg" />
+<FeishuLoginButton size="md" fullWidth />
+<FeishuLoginButton label="使用其他飞书账号登录" />
+```
+
+## 后端要实现的端点
+
+模板默认请求这几个端点：
+
+| 端点 | 用途 | 后端实现 |
+|---|---|---|
+| `GET /auth/feishu/login` | 触发登录 | 后端 OAuth 模板已实现 |
+| `GET /auth/feishu/callback` | 飞书回调 | 后端 OAuth 模板已实现 |
+| `POST /auth/feishu/logout` | 退出 | **你需自己加**（清 session cookie） |
+| `GET /api/me` | 当前用户 | **你需自己加**（从 session 拿用户、查库返回） |
+
+后端 `/api/me` 返回 JSON：
 ```json
-{ "name": "张三", "email": "...", "avatar_url": "..." }
+{ "name": "张三", "email": "...", "avatar_url": "...", "open_id": "ou_..." }
 ```
 
-未登录时返 `401`。这个端点不在 SKILL.md 主流程的 5 个阶段里——你需要在阶段 4 写后端时顺手加上：
+未登录返 401。
 
-```go
-// 伪代码
-GET /api/me  →  从 session cookie 拿 localUserID → 查库 → 返 user JSON
-```
+## 视觉规范
 
-## 跨域 / cookie 注意
+模板严格遵守 `assets/login-ui-spec.md` 的视觉值。**不要修改：**
+- FBIF 蓝 `#145078`
+- 按钮高度 44px (md) / 52px (lg)
+- 文案"使用 FBIF 登录"
+- Logo 尺寸 88px (登录页) / 20px (按钮内)
 
-如果前端和后端是**同源**部署（生产推荐），`fetch` 用 `credentials: 'include'` 即可（模板已包含）。
+如果项目设计系统强制冲突，按视觉值保留色/字号，只换实现方式（如 inline → Tailwind class）。
 
-如果前后端**跨域**：
-1. 后端要设 `Access-Control-Allow-Origin: <前端域名>` + `Access-Control-Allow-Credentials: true`
-2. cookie 要 `SameSite=None; Secure`
-3. 仅生产 https 能用（http 跨域 cookie 不带）
+## 验证
 
-> 强烈建议生产用同源——把前端构建产物挂在后端的某个路径下，省所有跨域麻烦。
+启动后浏览器访问登录页：
+
+1. 看到 FBIF logo 顶部居中、蓝黄字标
+2. 卡片浅色背景、清爽对比
+3. 蓝色按钮"使用 FBIF 登录"含飞书 logo
+4. 点按钮 → 跳到飞书授权页
+5. 授权后跳回应用、登录态生效

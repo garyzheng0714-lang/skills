@@ -8,12 +8,15 @@
 //   import "<your-module>/internal/auth"
 //   mux.Handle("/auth/feishu/", auth.NewFeishuHandler())
 //
-// 环境变量（必须）：
-//   FEISHU_APP_SECRET  → App Secret，必须从环境变量注入，绝不写代码
+// 环境变量：
+//   FEISHU_APP_SECRET            → 必填。App Secret，必须从环境变量注入，绝不写代码
+//   FEISHU_ALLOWED_TENANT_KEYS   → 选填。逗号分隔的 tenant_key 白名单，限制只允许这些企业登录
+//                                  留空 = 不限制（任何能拿到授权的飞书账号都能登）
+//                                  设了 = defense-in-depth，飞书后台"应用可用范围"是第一道防线
 //
 // 路由：
 //   GET /auth/feishu/login    → 生成 state，302 跳飞书授权页
-//   GET /auth/feishu/callback → 处理回调：核对 state、换 token、拿用户信息、建 session
+//   GET /auth/feishu/callback → 处理回调：核对 state、换 token、拿用户信息、检查 tenant、建 session
 
 package auth
 
@@ -28,6 +31,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -136,7 +140,14 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. upsert 本地用户、建你自己的 session
+	// 5. tenant_key 白名单兜底（飞书后台"应用可用范围"是第一道防线，这是第二道）
+	if !isAllowedTenant(user.TenantKey) {
+		log.Printf("login denied: tenant_key %q not in FEISHU_ALLOWED_TENANT_KEYS", user.TenantKey)
+		http.Redirect(w, r, "/login?error=unauthorized_tenant", http.StatusFound)
+		return
+	}
+
+	// 6. upsert 本地用户、建你自己的 session
 	//    ⚠️ 用 OpenID 做外键，不要用 email/mobile（可改）
 	//    ⚠️ 你自己的 session cookie，不要把 token 给浏览器
 	localUserID, err := upsertLocalUser(user)
@@ -223,6 +234,21 @@ func randomState(byteLen int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// isAllowedTenant 检查 tenant_key 是否在 FEISHU_ALLOWED_TENANT_KEYS 白名单里。
+// 未配置 = 不限制（返 true）。配置了 = 仅允许列表内的 tenant_key。
+func isAllowedTenant(tenantKey string) bool {
+	allowed := os.Getenv("FEISHU_ALLOWED_TENANT_KEYS")
+	if allowed == "" {
+		return true
+	}
+	for _, k := range strings.Split(allowed, ",") {
+		if strings.TrimSpace(k) == tenantKey {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- 下面两个函数你需要按自己应用替换实现 ----

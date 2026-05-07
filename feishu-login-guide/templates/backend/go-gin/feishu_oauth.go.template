@@ -9,7 +9,9 @@
 //   r := gin.Default()
 //   auth.RegisterFeishuRoutes(r)
 //
-// 环境变量：FEISHU_APP_SECRET（必须）
+// 环境变量：
+//   FEISHU_APP_SECRET            必填。App Secret
+//   FEISHU_ALLOWED_TENANT_KEYS   选填。逗号分隔白名单，限制只允许这些企业登录（兜底，飞书后台"应用可用范围"是第一道防线）
 
 package auth
 
@@ -24,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -113,7 +116,14 @@ func handleCallback(c *gin.Context) {
 		return
 	}
 
-	// 4. upsert 本地用户、建 session
+	// 4. tenant_key 白名单兜底（仅当 FEISHU_ALLOWED_TENANT_KEYS 已配置）
+	if !isAllowedTenant(user.TenantKey) {
+		log.Printf("login denied: tenant_key %q not allowed", user.TenantKey)
+		c.Redirect(http.StatusFound, "/login?error=unauthorized_tenant")
+		return
+	}
+
+	// 5. upsert 本地用户、建 session
 	localID, err := upsertLocalUser(user)
 	if err != nil {
 		c.String(http.StatusInternalServerError, "internal error")
@@ -186,6 +196,20 @@ func randomState(n int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// isAllowedTenant 检查 tenant_key 是否在白名单内。未配置 = 不限制。
+func isAllowedTenant(tenantKey string) bool {
+	allowed := os.Getenv("FEISHU_ALLOWED_TENANT_KEYS")
+	if allowed == "" {
+		return true
+	}
+	for _, k := range strings.Split(allowed, ",") {
+		if strings.TrimSpace(k) == tenantKey {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- 你需要按自己应用替换 ----

@@ -43,7 +43,7 @@ git@github.com:garyzheng0714-lang/skills.git
 | `feishu-base-parser` | 解析飞书多维表格 `.base` 文件，输出业务结构和逻辑文档。 |
 | `feishu-bitable-sidebar-plugin` | 飞书多维表格边栏插件开发，覆盖变量提取、字段绑定、固定宽度布局和端口排障。 |
 | `feishu-bot-quickstart` | 快速搭建飞书机器人长连接服务，完成鉴权、收发消息和排障。 |
-| `feishu-login-guide` | 飞书 OAuth 登录从零接入教程，覆盖网页跳转/扫码/端内免登，含 Go/Node/Python/React 模板。 |
+| `feishu-login-guide` | AI 执行手册：稳定接入飞书 OAuth 登录，自带 FBIF 品牌登录页（浅色 + FBIF logo）、tenant_key 白名单兜底、Go/Node/Python 后端 + React 前端模板。 |
 | `feishu-web-component-library` | 按飞书官方风格规范构建 Web 界面与组件。 |
 | `ffmpeg-video-editor` | 将自然语言视频编辑需求转换为 FFmpeg 命令。 |
 | `find-skills` | 搜索、发现并安装可用 skills。 |
