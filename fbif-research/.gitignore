@@ -1,0 +1,14 @@
+oss-config.json
+bitable-config.json
+.gstack/
+.context/
+.omc/
+.locks/
+logs/
+outputs/
+.batch-pid
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*

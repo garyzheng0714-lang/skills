@@ -1,0 +1,82 @@
+<!--
+  FBIF深度品牌调研 — 附录来源索引页模板
+  版本：v4.0
+
+  占位符：
+  {{BRAND_NAME}} — 品牌英文名
+  {{DATE}}       — 调研日期
+  {{APPENDIX_TABLE_HTML}} — 来源索引表的<tr>行
+  {{SOURCE_COUNT}}        — 来源总数
+  {{NAV_LINKS}}           — 底部所有模块导航链接
+-->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>来源索引 — {{BRAND_NAME}}调研</title>
+<style>
+:root{--bg:#f7f8fa;--b:#dfe3e8;--t:#1a1b1e;--t2:#5f6368;--a:#1a73e8;--abg:#e8f0fe;--g:#188038}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--t);line-height:1.8;font-size:14.5px}
+.topbar{position:sticky;top:0;z-index:200;background:#fff;border-bottom:1px solid var(--b);display:flex;align-items:center;padding:8px 20px;height:44px;gap:10px}
+.topbar a{color:var(--a);text-decoration:none;font-size:13px;font-weight:500}
+.topbar .title{font-size:13px;font-weight:700}
+.mn{max-width:960px;margin:0 auto;padding:24px 32px 60px}
+h1{font-size:22px;font-weight:700;margin-bottom:14px;padding-bottom:8px;border-bottom:2px solid var(--a)}
+.src-index{width:100%;border-collapse:collapse;font-size:12.5px;margin:10px 0}
+.src-index thead{background:#f1f5f9}
+.src-index th{padding:8px 10px;text-align:left;font-weight:600;font-size:11.5px;color:var(--t2);border-bottom:2px solid var(--b);white-space:nowrap}
+.src-index td{padding:8px 10px;border-bottom:1px solid var(--b);vertical-align:top;line-height:1.5}
+.src-index tr:hover{background:#f8fafc}
+.src-index td:first-child{text-align:center;color:var(--t2);font-size:11px;width:30px}
+.src-index td:nth-child(2){font-weight:500;max-width:280px}
+.src-index a{color:var(--a);text-decoration:none;font-size:11px}
+.cb{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;font-size:12px;border:1px solid var(--b);background:#fff;color:var(--t2);border-radius:4px;cursor:pointer;margin-bottom:14px}
+.cb:hover{border-color:var(--a);color:var(--a);background:var(--abg)}
+.nav-all{margin-top:20px;padding:14px 18px;background:#fff;border:1px solid var(--b);border-radius:6px}
+.nav-all h3{font-size:13px;font-weight:600;margin-bottom:8px;color:var(--t2)}
+.nav-all .links{display:flex;flex-wrap:wrap;gap:6px}
+.nav-all .links a{font-size:12px;color:var(--a);text-decoration:none;padding:3px 8px;background:var(--abg);border-radius:3px}
+.nav-all .links a:hover{background:var(--a);color:#fff}
+.ft{margin-top:24px;padding-top:14px;border-top:1px solid var(--b);font-size:11px;color:var(--t2);text-align:center}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a href="index.html">← 返回目录</a>
+  <span class="title">{{BRAND_NAME}}调研 · 全部来源索引</span>
+</div>
+<div class="mn">
+<h1>全部来源索引（共{{SOURCE_COUNT}}条）</h1>
+<button class="cb" onclick="copyTable()">📋 复制来源表格</button>
+<table class="src-index" id="src-table">
+  <thead>
+    <tr><th>#</th><th>来源标题</th><th>平台来源</th><th>发布时间</th><th>作者</th><th>一句话中文摘要</th><th>链接</th></tr>
+  </thead>
+  <tbody>
+    {{APPENDIX_TABLE_HTML}}
+  </tbody>
+</table>
+
+<div class="nav-all">
+  <h3>全部模块</h3>
+  <div class="links">
+    <a href="index.html">📋 总目录</a>
+    {{NAV_LINKS}}
+  </div>
+</div>
+<div class="ft">FBIF食品饮料创新 · {{BRAND_NAME}}深度品牌调研 · {{DATE}}</div>
+</div>
+<script>
+function copyTable(){
+  try{
+    var el=document.getElementById("src-table");
+    var ta=document.createElement("textarea");ta.value=el?el.innerText:"";
+    ta.style.position="fixed";ta.style.left="-9999px";
+    document.body.appendChild(ta);ta.select();document.execCommand("copy");
+    document.body.removeChild(ta);
+  }catch(e){}
+}
+</script>
+</body>
+</html>
