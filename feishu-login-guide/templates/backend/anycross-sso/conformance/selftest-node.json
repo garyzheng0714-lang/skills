@@ -1,0 +1,170 @@
+{
+  "at": "2026-10-16T03:16:26.630Z",
+  "start": "node --experimental-strip-types --no-warnings /var/folders/lc/ryd97mhx4hqf5q3f8b8vzpqw0000gn/T//sso-selftest-node.05BvMD/server.ts",
+  "results": [
+    {
+      "name": "停用名单从没同步成功过：拒绝登录，同步上了才放人",
+      "ok": true
+    },
+    {
+      "name": "没登录访问受保护接口一律被拒",
+      "ok": true
+    },
+    {
+      "name": "正常登录：授权码 + PKCE + state + nonce，会话只是随机 cookie",
+      "ok": true
+    },
+    {
+      "name": "登录后只回本站路径",
+      "ok": true
+    },
+    {
+      "name": "回调链接换个浏览器打开登不进去（state 绑定浏览器）",
+      "ok": true
+    },
+    {
+      "name": "state 被改过就拒绝",
+      "ok": true
+    },
+    {
+      "name": "id_token 签发方不对：拒绝登录",
+      "ok": true
+    },
+    {
+      "name": "id_token 受众不是本项目：拒绝登录",
+      "ok": true
+    },
+    {
+      "name": "id_token 签名不对：拒绝登录",
+      "ok": true
+    },
+    {
+      "name": "id_token 用 HS256 签名：拒绝登录",
+      "ok": true
+    },
+    {
+      "name": "id_token nonce 对不上：拒绝登录",
+      "ok": true
+    },
+    {
+      "name": "id_token 已过期：拒绝登录",
+      "ok": true
+    },
+    {
+      "name": "不是 FBIF/富的的租户：拒绝登录",
+      "ok": true
+    },
+    {
+      "name": "按 company_code + sub 认人：富的账号无邮箱也能登；同一 sub 换了租户是另一个人",
+      "ok": true
+    },
+    {
+      "name": "用户信息里的 sub 和 id_token 对不上：拒绝登录",
+      "ok": true
+    },
+    {
+      "name": "没给 refresh_token（没勾 offline_access）：拒绝登录",
+      "ok": true
+    },
+    {
+      "name": "换令牌失败不重试（重放会作废令牌）",
+      "ok": true
+    },
+    {
+      "name": "用户信息返回 403：最多一个核对周期内下线，并撤销 refresh_token",
+      "ok": true
+    },
+    {
+      "name": "refresh_token 被集成平台拒绝（JSON 400 或纯文本 403）：会话作废",
+      "ok": true
+    },
+    {
+      "name": "集成平台故障：普通接口照常用，且不是每个请求都去刷新",
+      "ok": true
+    },
+    {
+      "name": "敏感接口当场核对，不等核对周期",
+      "ok": true
+    },
+    {
+      "name": "假提醒：收下返回 202，只多读一次名单，谁都不受影响",
+      "ok": true
+    },
+    {
+      "name": "名单加人：几秒内踢掉他所有会话、撤销 refresh_token、再登录被拒，别人不受影响",
+      "ok": true
+    },
+    {
+      "name": "重复的和更旧的提醒：不去读名单",
+      "ok": true
+    },
+    {
+      "name": "revision 为 0：无条件重读",
+      "ok": true
+    },
+    {
+      "name": "名单没读全：保留旧名单，停用的人仍然进不来",
+      "ok": true
+    },
+    {
+      "name": "管理员恢复后：本人重新登录即可，旧会话不复活",
+      "ok": true
+    },
+    {
+      "name": "名单落盘：重启后读不到集成平台也照样拒绝停用的人",
+      "ok": true
+    },
+    {
+      "name": "晚到的旧名单（版本号更小）不能盖掉新名单",
+      "ok": true
+    },
+    {
+      "name": "退出只退这个项目这个浏览器：同一人的其他浏览器、其他项目都不受影响",
+      "ok": true
+    },
+    {
+      "name": "退出不接受 GET（防止被链接触发）",
+      "ok": true
+    },
+    {
+      "name": "账号密码登录：对了发会话 cookie，错了一律 401 且不说错在哪",
+      "ok": true
+    },
+    {
+      "name": "拉账号表时带上本项目的源（system = 登录回调地址的 scheme://host:port），只发 JSON",
+      "ok": true
+    },
+    {
+      "name": "同一账号连错 5 次锁住：密码对了也进不去，别的账号不受影响",
+      "ok": true
+    },
+    {
+      "name": "账号密码登录只收 JSON（跨站表单发不过来）",
+      "ok": true
+    },
+    {
+      "name": "账号会话不找集成平台核对；停用（从账号表里去掉）最多一个核对周期内下线、再登录被拒",
+      "ok": true
+    },
+    {
+      "name": "管理员重置密码：登着的会话最多一个核对周期内下线，旧密码登不上，新密码能登",
+      "ok": true
+    },
+    {
+      "name": "账号到期：到期的登不上，登着的会话到期后最多一个核对周期内下线",
+      "ok": true
+    },
+    {
+      "name": "账号表过了有效期，并发登录只拉一次",
+      "ok": true
+    },
+    {
+      "name": "账号表拉不到（500、坏 JSON、complete 不是 true）：用上一份照常登录",
+      "ok": true
+    },
+    {
+      "name": "账号会话：退出后旧 cookie 作废，敏感接口只认飞书身份",
+      "ok": true
+    }
+  ]
+}

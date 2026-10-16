@@ -1,0 +1,272 @@
+// 统一登录页 · v8（2026-10-11 用户裁决：所有项目的登录页一模一样，不出现项目名，必须能用账号密码登录）
+//
+// 这是全部项目登录页的唯一来源。原样复制到 <project>/src/lib/feishuSignIn.tsx，一个字都不改。
+// - FeishuSignInPage 不接受任何参数：不写项目名、副标题、项目专属文案。
+// - 改登录页只改这份模板（feishu-login-guide/templates/frontend/react-vite/），再同步到所有项目；
+//   项目里的副本不要改：要改回来改这份模板。
+// 前提：项目已接入 Su Design（React + Tailwind v4，components.json 里有 @su，已装 @su/theme；没接就先说「用 su-design」接入）。
+// 依赖：
+//   1. npx shadcn@latest add @su/sign-in-card @su/button @su/field @su/input @su/separator @su/avatar --overwrite
+//   2. ./session.ts（session.ts.template，同样原样复制）
+//   3. 静态资产：assets/mascots/{door-login.webp,fbif-logo.png,feishu-mark.svg} → <project>/public/mascots/
+//   4. index.html preload：
+//        <link rel="preload" as="image" href="/mascots/door-login.webp" media="(min-width: 576px)" />
+//        <link rel="preload" as="image" href="/mascots/fbif-logo.png" />
+//   5. 后端两条登录路由：
+//        GET  /auth/feishu/fbif/login?next=<本站路径>      飞书登录
+//        POST /auth/account/login  {username, password}   账号密码 → 200（可带 session_token）| 401 auth_failed | 429 rate_limited
+//      路线 A（templates/backend/anycross-sso）两条都已带上，只用 cookie、不回 session_token。
+//      v4 的四套后端模板只有飞书登录：账号密码按 references/scenarios/account-password.md 补上，否则表单点了必失败。
+//
+// 视觉全部来自 Su Design：登录卡（SignInCard）、Button、Field、Input、Separator，这里不写色值、圆角、阴影。
+// 结构照先例（Gumloop、Square、MagicPath、Mercor 的共性）：第三方登录按钮在上（描边 + 品牌标），「或」分隔，
+// 下面账号、密码、登录（一屏唯一的实心主按钮）。不做注册、忘记密码、记住我。
+
+import { useEffect, useRef, useState } from 'react';
+import type { FormEvent, ReactNode } from 'react';
+
+import { Avatar } from '@/components/ui/avatar';
+import { Button } from '@/components/ui/button';
+import { Field, FieldError, FieldLabel } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import { Separator } from '@/components/ui/separator';
+import { SignInCard } from '@/components/ui/sign-in-card';
+import { apiFetch, clearSessionToken, setSessionToken } from './session';
+
+const CALLBACK_ERRORS: Record<string, string> = {
+  denied: '已取消飞书授权，请重新登录',
+  unauthorized_tenant: '当前飞书账号无权访问，请联系管理员',
+  disabled: '你的账号已停用，请联系管理员',
+  expired: '登录已超时，请重新登录',
+};
+
+/** 登录后要回的页面：只接受本站路径（防止被拼成跳到外站的链接），登录相关页面不算 */
+export function safeNext(next: string | null | undefined): string | null {
+  if (!next || !/^\/(?![\/\\])/.test(next)) return null;
+  if (/^\/(login|auth)(\/|\?|#|$)/.test(next)) return null;
+  return next;
+}
+
+/** 读回调带回的 ?error=，读完就从地址栏去掉（刷新、收藏不再显示旧错误），next 留着 */
+function takeCallbackError(): string {
+  if (typeof window === 'undefined') return '';
+  const url = new URL(window.location.href);
+  const code = url.searchParams.get('error');
+  if (!code) return '';
+  url.searchParams.delete('error');
+  history.replaceState(history.state, '', url.pathname + url.search + url.hash);
+  return CALLBACK_ERRORS[code] ?? '飞书登录失败，请重新尝试';
+}
+
+function currentNext(): string | null {
+  if (typeof window === 'undefined') return null;
+  return safeNext(new URLSearchParams(window.location.search).get('next'));
+}
+
+export function FeishuSignInPage() {
+  // 飞书回调带回的错误（不属于哪一格）在卡片底部；账号密码的错误在密码下面
+  const [error, setError] = useState(takeCallbackError);
+  const [busy, setBusy] = useState<'feishu' | 'account' | null>(null);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [accountError, setAccountError] = useState('');
+  const usernameInput = useRef<HTMLInputElement>(null);
+  const passwordInput = useRef<HTMLInputElement>(null);
+
+  // 从飞书授权页按返回：浏览器把整页从缓存里还原，按钮还停在转圈，复位
+  useEffect(() => {
+    const onShow = (e: PageTransitionEvent) => {
+      if (e.persisted) setBusy(null);
+    };
+    window.addEventListener('pageshow', onShow);
+    return () => window.removeEventListener('pageshow', onShow);
+  }, []);
+
+  function signInWithFeishu() {
+    setBusy('feishu');
+    const next = currentNext();
+    window.location.href = '/auth/feishu/fbif/login' + (next ? `?next=${encodeURIComponent(next)}` : '');
+  }
+
+  async function signInWithAccount(event: FormEvent) {
+    event.preventDefault();
+    if (busy) return;
+    // 空着提交：焦点回到空的那一格，不弹错误（和 Su Design 站点登录页一致）
+    if (!username.trim()) return usernameInput.current?.focus();
+    if (!password) return passwordInput.current?.focus();
+    setBusy('account');
+    setError('');
+    setAccountError('');
+    try {
+      const res = await apiFetch('/auth/account/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username.trim(), password }),
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (data.session_token) setSessionToken(data.session_token);
+        window.location.replace(currentNext() ?? '/');
+        return;
+      }
+      // 原因写在密码下面、密码框红边（先例：Shopify、SoundCloud、Etsy、Google；Su Design 站点登录页同样）
+      setAccountError(res.status === 401 ? '账号或密码错误' : res.status === 429 ? '尝试次数过多，请稍后再试' : '登录失败，请重新尝试');
+    } catch {
+      setAccountError('网络连接失败，请重新尝试');
+    }
+    setBusy(null);
+    passwordInput.current?.select();
+  }
+
+  return (
+    <main className="grid min-h-dvh place-items-center bg-canvas p-inset">
+      <SignInCard
+        art="/mascots/door-login.webp"
+        logo={<img src="/mascots/fbif-logo.png" alt="FBIF" draggable={false} className="h-12 w-auto select-none" />}
+        error={error || undefined}
+      >
+        <Button
+          variant="tertiary"
+          size="lg"
+          className="w-full"
+          loading={busy === 'feishu'}
+          aria-disabled={busy === 'account' || undefined}
+          onClick={signInWithFeishu}
+        >
+          <img src="/mascots/feishu-mark.svg" alt="" className="size-5" />
+          使用飞书登录
+        </Button>
+        <div aria-hidden className="flex items-center gap-3 text-xs text-fg-muted">
+          <Separator className="flex-1" />或<Separator className="flex-1" />
+        </div>
+        <form noValidate onSubmit={signInWithAccount} className="grid gap-item">
+          <Field>
+            <FieldLabel>账号</FieldLabel>
+            <Input
+              ref={usernameInput}
+              name="username"
+              autoComplete="username"
+              autoCapitalize="none"
+              spellCheck={false}
+              value={username}
+              readOnly={busy === 'account'}
+              onChange={(e) => {
+                setUsername(e.target.value);
+                setAccountError('');
+              }}
+            />
+          </Field>
+          <Field>
+            <FieldLabel>密码</FieldLabel>
+            <Input
+              ref={passwordInput}
+              name="password"
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              readOnly={busy === 'account'}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                setAccountError('');
+              }}
+            />
+            <FieldError>{accountError}</FieldError>
+          </Field>
+          <Button
+            type="submit"
+            size="lg"
+            className="w-full"
+            loading={busy === 'account'}
+            aria-disabled={busy === 'feishu' || undefined}
+          >
+            登录
+          </Button>
+        </form>
+      </SignInCard>
+    </main>
+  );
+}
+
+// ============================================================
+// 登录态配套件（useCurrentUser / RequireAuth / FeishuUserBadge）
+// 请求统一走 apiFetch（cookie + X-Session-Token 双通道）
+// ============================================================
+
+export interface CurrentUser {
+  id?: string;
+  name: string;
+  email?: string;
+  avatar_url?: string;
+  open_id?: string;
+  tenant_key?: string;
+}
+
+export function useCurrentUser() {
+  const [user, setUser] = useState<CurrentUser | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch('/api/me')
+      .then((r) => (r.ok ? r.json() : null)) // 非 2xx 一律视为未登录，勿把 5xx 错误体当用户对象
+      .then((data) => {
+        if (cancelled) return;
+        setUser(data);
+        setLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setUser(null);
+        setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return { user, loading };
+}
+
+/** 没登录就去登录页，并带上当前页面，登录完回到这里 */
+export function RequireAuth({
+  children,
+  loginPath = '/login',
+}: {
+  children: ReactNode;
+  loginPath?: string;
+}) {
+  const { user, loading } = useCurrentUser();
+  if (loading) return null;
+  if (!user) {
+    if (typeof window !== 'undefined') {
+      const next = safeNext(window.location.pathname + window.location.search);
+      window.location.href = loginPath + (next ? `?next=${encodeURIComponent(next)}` : '');
+    }
+    return null;
+  }
+  return <>{children}</>;
+}
+
+export function FeishuUserBadge({
+  user,
+  onLogout,
+}: {
+  user: CurrentUser;
+  onLogout?: () => void;
+}) {
+  const handleLogout = async () => {
+    await apiFetch('/auth/feishu/logout', { method: 'POST' });
+    clearSessionToken();
+    if (onLogout) onLogout();
+    else window.location.href = '/login';
+  };
+  return (
+    <div className="inline-flex items-center gap-2">
+      <Avatar name={user.name} src={user.avatar_url} size={32} />
+      <span className="text-sm font-medium text-fg">{user.name}</span>
+      <Button variant="ghost" size="sm" onClick={handleLogout}>
+        退出
+      </Button>
+    </div>
+  );
+}

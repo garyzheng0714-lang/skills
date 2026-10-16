@@ -1,0 +1,346 @@
+// 飞书登录处理（FBIF + 富的 双企业 App，Express + TypeScript）
+//
+// 占位符：
+//   {{FBIF_APP_ID}}   → FBIF 主企业飞书 App ID（cli_xxx），从密钥仓库读
+//   {{FUDE_APP_ID}}   → 富的 App ID，从密钥仓库读
+//
+// 所有 App ID / Secret 都从密钥仓库（~/Library/Mobile Documents/com~apple~CloudDocs/
+// 密钥/FBIF登录应用APPid和密钥/feishu-app-credentials.md）取，绝不在代码里 fallback。
+//
+// 使用：
+//   import { feishuRouter } from './middleware/feishuOauth';
+//   app.use(cookieParser());          // 需要 cookie-parser
+//   app.use(feishuRouter);
+//
+// 环境变量（全部必填，缺则启动时报错）：
+//   FEISHU_FBIF_APP_SECRET   FBIF App Secret
+//   FEISHU_FUDE_APP_SECRET   富的 App Secret
+//   FEISHU_REDIRECT_BASE     部署 URL，不带路径（绝对不能是 http://localhost:...）
+//   FEISHU_ALLOWED_TENANT_KEYS  选填，逗号分隔白名单
+//
+// 路由：
+//   GET  /auth/feishu/fbif/login        FBIF 按钮模式
+//   GET  /auth/feishu/fbif/callback     FBIF 按钮回调（v2 token）
+//   GET  /auth/feishu/fbif/qr-config    FBIF 扫码配置
+//   GET  /auth/feishu/fbif/qr-callback  FBIF 扫码回调（v1 token）
+//   GET  /auth/feishu/fude/...          富的 4 条同上
+//   POST /auth/feishu/logout            退出登录（共享）
+
+import { Router, Request, Response } from 'express';
+import { randomBytes } from 'crypto';
+
+// ========== 双 App 配置 ==========
+
+const FBIF_APP_ID = '{{FBIF_APP_ID}}';
+
+// 富的文化传媒（上海）有限公司 App（v3 起跨项目共享）
+const FUDE_APP_ID = '{{FUDE_APP_ID}}';
+
+// 按钮模式：v2 OAuth
+const AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
+const TOKEN_V2_URL = 'https://open.feishu.cn/open-apis/authen/v2/oauth/token';
+
+// 扫码模式：v1 OAuth (passport.feishu.cn)
+const QR_AUTHORIZE_URL = 'https://passport.feishu.cn/suite/passport/oauth/authorize';
+const APP_TOKEN_URL = 'https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal';
+const TOKEN_V1_URL = 'https://open.feishu.cn/open-apis/authen/v1/access_token';
+
+const USER_INFO_URL = 'https://open.feishu.cn/open-apis/authen/v1/user_info';
+
+const STATE_TTL_MS = 10 * 60 * 1000;
+
+type Tenant = 'fbif' | 'fude';
+const ALL_TENANTS: Tenant[] = ['fbif', 'fude'];
+
+interface TenantConfig {
+  appId: string;
+  secretEnv: string;
+}
+
+const TENANT_CONFIG: Record<Tenant, TenantConfig> = {
+  fbif: { appId: FBIF_APP_ID, secretEnv: 'FEISHU_FBIF_APP_SECRET' },
+  fude: { appId: FUDE_APP_ID, secretEnv: 'FEISHU_FUDE_APP_SECRET' },
+};
+
+function tenantSecret(t: Tenant): string {
+  const cfg = TENANT_CONFIG[t];
+  const v = process.env[cfg.secretEnv];
+  if (!v) {
+    // 不允许任何 fallback：缺 env 立刻失败，定位清楚
+    throw new Error(
+      `${cfg.secretEnv} not set. Read it from the credentials vault: ` +
+      `~/Library/Mobile Documents/com~apple~CloudDocs/密钥/FBIF登录应用APPid和密钥/`
+    );
+  }
+  return v;
+}
+
+function redirectBase(): string {
+  return (process.env.FEISHU_REDIRECT_BASE || 'http://localhost:8080').replace(/\/+$/, '');
+}
+
+function callbackUri(t: Tenant): string {
+  return `${redirectBase()}/auth/feishu/${t}/callback`;
+}
+
+function qrCallbackUri(t: Tenant): string {
+  return `${redirectBase()}/auth/feishu/${t}/qr-callback`;
+}
+
+function stateCookieName(t: Tenant, mode: 'oauth' | 'qr'): string {
+  return `feishu_state_${t}_${mode}`;
+}
+
+interface FeishuUser {
+  open_id: string;
+  union_id: string;
+  user_id?: string;
+  name: string;
+  en_name?: string;
+  avatar_url: string;
+  email?: string;
+  mobile?: string;
+  tenant_key: string;
+}
+
+export const feishuRouter = Router();
+
+// ========== 注册路由（每个 tenant 一组） ==========
+
+for (const t of ALL_TENANTS) {
+  feishuRouter.get(`/auth/feishu/${t}/login`, (req, res) => handleLogin(req, res, t));
+  feishuRouter.get(`/auth/feishu/${t}/callback`, (req, res) => handleCallback(req, res, t));
+  feishuRouter.get(`/auth/feishu/${t}/qr-config`, (req, res) => handleQRConfig(req, res, t));
+  feishuRouter.get(`/auth/feishu/${t}/qr-callback`, (req, res) => handleQRCallback(req, res, t));
+}
+
+feishuRouter.post('/auth/feishu/logout', handleLogout);
+
+// ========== 按钮模式 ==========
+
+function handleLogin(req: Request, res: Response, t: Tenant): void {
+  const state = randomBytes(24).toString('base64url');
+  setStateCookie(req, res, stateCookieName(t, 'oauth'), state);
+
+  const params = new URLSearchParams({
+    client_id: TENANT_CONFIG[t].appId,
+    redirect_uri: callbackUri(t),
+    response_type: 'code',
+    state,
+  });
+  res.redirect(`${AUTHORIZE_URL}?${params.toString()}`);
+}
+
+async function handleCallback(req: Request, res: Response, t: Tenant): Promise<void> {
+  if (!verifyAndClearStateCookie(req, res, stateCookieName(t, 'oauth'))) {
+    res.status(403).send('state mismatch');
+    return;
+  }
+  if (req.query.error) {
+    console.log(`feishu authorize denied (${t}):`, req.query.error, req.query.error_description);
+    res.redirect('/login?error=denied');
+    return;
+  }
+  const code = req.query.code as string;
+  if (!code) {
+    res.status(400).send('missing code');
+    return;
+  }
+
+  try {
+    const token = await exchangeCodeV2(t, code);
+    await finishLogin(res, t, token);
+  } catch (err) {
+    console.error(`feishu callback failed (${t}):`, (err as Error).message);
+    res.status(500).send('login failed');
+  }
+}
+
+// ========== 扫码模式 ==========
+
+function handleQRConfig(req: Request, res: Response, t: Tenant): void {
+  const state = randomBytes(24).toString('base64url');
+  setStateCookie(req, res, stateCookieName(t, 'qr'), state);
+
+  const params = new URLSearchParams({
+    client_id: TENANT_CONFIG[t].appId,
+    redirect_uri: qrCallbackUri(t),
+    response_type: 'code',
+    state,
+  });
+  res.set('Cache-Control', 'no-store').json({
+    goto: `${QR_AUTHORIZE_URL}?${params.toString()}`,
+    state,
+    expires_in: 300,
+  });
+}
+
+async function handleQRCallback(req: Request, res: Response, t: Tenant): Promise<void> {
+  if (!verifyAndClearStateCookie(req, res, stateCookieName(t, 'qr'))) {
+    res.status(403).send('state mismatch');
+    return;
+  }
+  if (req.query.error) {
+    console.log(
+      `feishu QR authorize denied (${t}):`,
+      req.query.error,
+      req.query.error_description,
+    );
+    res.redirect('/login?error=denied');
+    return;
+  }
+  const code = req.query.code as string;
+  if (!code) {
+    res.status(400).send('missing code');
+    return;
+  }
+
+  try {
+    const appToken = await getAppAccessToken(t);
+    const userToken = await exchangeCodeV1(code, appToken);
+    await finishLogin(res, t, userToken);
+  } catch (err) {
+    console.error(`feishu QR callback failed (${t}):`, (err as Error).message);
+    res.status(500).send('login failed');
+  }
+}
+
+// ========== Logout（共享） ==========
+
+function handleLogout(_req: Request, res: Response): void {
+  // TODO: 调用项目现有 session 清理逻辑
+  res.status(204).end();
+}
+
+// ========== 共用 ==========
+
+async function finishLogin(res: Response, t: Tenant, userToken: string): Promise<void> {
+  const user = await fetchUserInfo(userToken);
+  console.log(
+    `[auth] login ok via ${t} tenant_key=${user.tenant_key} open_id=${user.open_id} name=${user.name}`,
+  );
+  if (!isAllowedTenant(user.tenant_key)) {
+    console.log(`login denied: tenant_key ${user.tenant_key} not allowed`);
+    res.redirect('/login?error=unauthorized_tenant');
+    return;
+  }
+  const localID = await upsertLocalUser(user);
+  createSession(res, localID);
+  res.redirect('/');
+}
+
+// ========== Token 兑换 ==========
+
+async function exchangeCodeV2(t: Tenant, code: string): Promise<string> {
+  const secret = tenantSecret(t);
+  const resp = await fetch(TOKEN_V2_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({
+      grant_type: 'authorization_code',
+      client_id: TENANT_CONFIG[t].appId,
+      client_secret: secret,
+      code,
+      redirect_uri: callbackUri(t),
+    }),
+  });
+  const data = (await resp.json()) as {
+    code: number;
+    access_token?: string;
+    error_description?: string;
+  };
+  if (data.code !== 0 || !data.access_token) {
+    throw new Error(`v2 token api code=${data.code} desc=${data.error_description}`);
+  }
+  return data.access_token;
+}
+
+async function getAppAccessToken(t: Tenant): Promise<string> {
+  const secret = tenantSecret(t);
+  const resp = await fetch(APP_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ app_id: TENANT_CONFIG[t].appId, app_secret: secret }),
+  });
+  const data = (await resp.json()) as {
+    code: number;
+    msg?: string;
+    app_access_token?: string;
+  };
+  if (data.code !== 0 || !data.app_access_token) {
+    throw new Error(`app_token api code=${data.code} msg=${data.msg}`);
+  }
+  return data.app_access_token;
+}
+
+async function exchangeCodeV1(code: string, appAccessToken: string): Promise<string> {
+  const resp = await fetch(TOKEN_V1_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      Authorization: `Bearer ${appAccessToken}`,
+    },
+    body: JSON.stringify({ grant_type: 'authorization_code', code }),
+  });
+  const data = (await resp.json()) as {
+    code: number;
+    msg?: string;
+    data?: { access_token?: string };
+  };
+  if (data.code !== 0 || !data.data?.access_token) {
+    throw new Error(`v1 token api code=${data.code} msg=${data.msg}`);
+  }
+  return data.data.access_token;
+}
+
+async function fetchUserInfo(token: string): Promise<FeishuUser> {
+  const resp = await fetch(USER_INFO_URL, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = (await resp.json()) as { code: number; msg: string; data: FeishuUser };
+  if (data.code !== 0) {
+    throw new Error(`user_info api code=${data.code} msg=${data.msg}`);
+  }
+  return data.data;
+}
+
+// ========== 工具 ==========
+
+function setStateCookie(req: Request, res: Response, name: string, value: string): void {
+  res.cookie(name, value, {
+    httpOnly: true,
+    secure: req.secure,
+    sameSite: 'lax',
+    path: '/auth/feishu',
+    maxAge: STATE_TTL_MS,
+  });
+}
+
+function verifyAndClearStateCookie(req: Request, res: Response, name: string): boolean {
+  const cookie = req.cookies?.[name];
+  const ok = !!cookie && cookie === req.query.state;
+  res.clearCookie(name, { path: '/auth/feishu' });
+  return ok;
+}
+
+function isAllowedTenant(tenantKey: string): boolean {
+  const allowed = process.env.FEISHU_ALLOWED_TENANT_KEYS;
+  if (!allowed) return true;
+  return allowed
+    .split(',')
+    .map((s) => s.trim())
+    .includes(tenantKey);
+}
+
+// ---- 你需要按自己应用替换 ----
+
+async function upsertLocalUser(u: FeishuUser): Promise<string> {
+  // TODO: 复用项目现有 IAM/user service，不要另建平行用户体系。
+  // 必须按 tenant_key + (user_id ?? open_id) 匹配；user_id 可能为空，open_id 是稳定兜底。
+  // FBIF 和 富的 用户都进同一张 users 表，靠 tenant_key 区分。
+  return u.open_id;
+}
+
+function createSession(res: Response, localUserID: string): void {
+  // TODO: 调用项目现有 session/RBAC 登录逻辑，设置自己的 HttpOnly session cookie。
+}

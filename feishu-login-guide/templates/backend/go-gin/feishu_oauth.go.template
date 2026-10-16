@@ -1,0 +1,437 @@
+// Package auth - 飞书登录处理（FBIF + 富的 双企业 App，Gin 版本）
+//
+// 占位符：
+//   {{FBIF_APP_ID}}     → FBIF 主企业飞书 App ID（cli_xxx），从密钥仓库读
+//   {{FUDE_APP_ID}}     → 富的 App ID，从密钥仓库读
+//
+// 所有 App ID / Secret 都从密钥仓库（~/Library/Mobile Documents/com~apple~CloudDocs/
+// 密钥/FBIF登录应用APPid和密钥/feishu-app-credentials.md）取，绝不在代码里 fallback。
+//
+// 使用：
+//   import "<your-module>/internal/auth"
+//   r := gin.Default()
+//   auth.RegisterFeishuRoutes(r)
+//
+// 环境变量（全部必填，缺则启动时报错）：
+//   FEISHU_FBIF_APP_SECRET   FBIF App Secret
+//   FEISHU_FUDE_APP_SECRET   富的 App Secret
+//   FEISHU_REDIRECT_BASE     部署 URL，不带路径（绝对不能是 http://localhost:...）
+//   FEISHU_ALLOWED_TENANT_KEYS  选填，逗号分隔白名单 tenant_key
+
+package auth
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+// ========== 双 App 配置 ==========
+
+const (
+	// FBIF 主企业 App ID（替换占位符；App ID 不是机密，但 Secret 严禁写死）
+	fbifAppID = "{{FBIF_APP_ID}}"
+
+	// 富的文化传媒（上海）有限公司 App（v3 起跨项目共享）
+	fudeAppID = "{{FUDE_APP_ID}}"
+
+	feishuAuthorizeURL = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
+	feishuTokenV2URL   = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
+
+	feishuQRAuthorizeURL = "https://passport.feishu.cn/suite/passport/oauth/authorize"
+	feishuAppTokenURL    = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal"
+	feishuTokenV1URL     = "https://open.feishu.cn/open-apis/authen/v1/access_token"
+
+	feishuUserInfoURL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
+
+	stateCookieMaxAge = 600
+)
+
+type tenant string
+
+const (
+	tenantFBIF tenant = "fbif"
+	tenantFUDE tenant = "fude"
+)
+
+var allTenants = []tenant{tenantFBIF, tenantFUDE}
+
+type tenantConfig struct {
+	appID     string
+	secretEnv string
+}
+
+func cfgFor(t tenant) tenantConfig {
+	switch t {
+	case tenantFBIF:
+		return tenantConfig{appID: fbifAppID, secretEnv: "FEISHU_FBIF_APP_SECRET"}
+	case tenantFUDE:
+		return tenantConfig{appID: fudeAppID, secretEnv: "FEISHU_FUDE_APP_SECRET"}
+	}
+	return tenantConfig{}
+}
+
+func (cfg tenantConfig) secret() (string, error) {
+	if v := os.Getenv(cfg.secretEnv); v != "" {
+		return v, nil
+	}
+	// 不允许任何 fallback：缺 env 立刻失败，定位清楚
+	return "", fmt.Errorf(
+		"%s not set. Read it from the credentials vault: "+
+			"~/Library/Mobile Documents/com~apple~CloudDocs/密钥/FBIF登录应用APPid和密钥/",
+		cfg.secretEnv,
+	)
+}
+
+func redirectBase() string {
+	base := os.Getenv("FEISHU_REDIRECT_BASE")
+	if base == "" {
+		base = "http://localhost:8080"
+	}
+	return strings.TrimRight(base, "/")
+}
+
+func callbackURI(t tenant) string {
+	return fmt.Sprintf("%s/auth/feishu/%s/callback", redirectBase(), t)
+}
+
+func qrCallbackURI(t tenant) string {
+	return fmt.Sprintf("%s/auth/feishu/%s/qr-callback", redirectBase(), t)
+}
+
+func stateCookieName(t tenant, mode string) string {
+	return fmt.Sprintf("feishu_state_%s_%s", t, mode)
+}
+
+// ========== 类型 ==========
+
+type FeishuUser struct {
+	OpenID    string `json:"open_id"`
+	UnionID   string `json:"union_id"`
+	UserID    string `json:"user_id"`
+	Name      string `json:"name"`
+	EnName    string `json:"en_name"`
+	AvatarURL string `json:"avatar_url"`
+	Email     string `json:"email"`
+	Mobile    string `json:"mobile"`
+	TenantKey string `json:"tenant_key"`
+}
+
+// ========== 路由注册 ==========
+
+func RegisterFeishuRoutes(r *gin.Engine) {
+	g := r.Group("/auth/feishu")
+	for _, t := range allTenants {
+		tn := t // capture for closures
+		tg := g.Group("/" + string(tn))
+		tg.GET("/login", func(c *gin.Context) { handleLogin(c, tn) })
+		tg.GET("/callback", func(c *gin.Context) { handleCallback(c, tn) })
+		tg.GET("/qr-config", func(c *gin.Context) { handleQRConfig(c, tn) })
+		tg.GET("/qr-callback", func(c *gin.Context) { handleQRCallback(c, tn) })
+	}
+	g.POST("/logout", handleLogout)
+	// GET /api/me 由项目自己的 router 挂载（共享 session 检查）
+}
+
+// ========== 按钮模式 ==========
+
+func handleLogin(c *gin.Context, t tenant) {
+	state, err := randomState(24)
+	if err != nil {
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	setStateCookie(c, stateCookieName(t, "oauth"), state)
+
+	cfg := cfgFor(t)
+	q := url.Values{}
+	q.Set("client_id", cfg.appID)
+	q.Set("redirect_uri", callbackURI(t))
+	q.Set("response_type", "code")
+	q.Set("state", state)
+	c.Redirect(http.StatusFound, feishuAuthorizeURL+"?"+q.Encode())
+}
+
+func handleCallback(c *gin.Context, t tenant) {
+	if !verifyAndClearStateCookie(c, stateCookieName(t, "oauth")) {
+		c.String(http.StatusForbidden, "state mismatch")
+		return
+	}
+	if errParam := c.Query("error"); errParam != "" {
+		log.Printf("feishu authorize denied (%s): %s", t, errParam)
+		c.Redirect(http.StatusFound, "/login?error=denied")
+		return
+	}
+	code := c.Query("code")
+	if code == "" {
+		c.String(http.StatusBadRequest, "missing code")
+		return
+	}
+	token, err := exchangeCodeV2(t, code)
+	if err != nil {
+		log.Printf("token v2 exchange (%s): %v", t, err)
+		c.String(http.StatusInternalServerError, "token exchange failed")
+		return
+	}
+	finishLogin(c, t, token)
+}
+
+// ========== 扫码模式 ==========
+
+func handleQRConfig(c *gin.Context, t tenant) {
+	state, err := randomState(24)
+	if err != nil {
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	setStateCookie(c, stateCookieName(t, "qr"), state)
+
+	cfg := cfgFor(t)
+	q := url.Values{}
+	q.Set("client_id", cfg.appID)
+	q.Set("redirect_uri", qrCallbackURI(t))
+	q.Set("response_type", "code")
+	q.Set("state", state)
+
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{
+		"goto":       feishuQRAuthorizeURL + "?" + q.Encode(),
+		"state":      state,
+		"expires_in": 300,
+	})
+}
+
+func handleQRCallback(c *gin.Context, t tenant) {
+	if !verifyAndClearStateCookie(c, stateCookieName(t, "qr")) {
+		c.String(http.StatusForbidden, "state mismatch")
+		return
+	}
+	if errParam := c.Query("error"); errParam != "" {
+		log.Printf("feishu QR authorize denied (%s): %s", t, errParam)
+		c.Redirect(http.StatusFound, "/login?error=denied")
+		return
+	}
+	code := c.Query("code")
+	if code == "" {
+		c.String(http.StatusBadRequest, "missing code")
+		return
+	}
+	appToken, err := getAppAccessToken(t)
+	if err != nil {
+		log.Printf("get app_access_token (%s): %v", t, err)
+		c.Redirect(http.StatusFound, "/login?error=app_token_failed")
+		return
+	}
+	token, err := exchangeCodeV1(code, appToken)
+	if err != nil {
+		log.Printf("token v1 exchange (%s): %v", t, err)
+		c.String(http.StatusInternalServerError, "token exchange failed")
+		return
+	}
+	finishLogin(c, t, token)
+}
+
+// ========== Logout（共享） ==========
+
+func handleLogout(c *gin.Context) {
+	// TODO: 调用项目现有 session 清理逻辑（清 cookie + 删服务端 session）
+	c.Status(http.StatusNoContent)
+}
+
+// ========== 共用收尾 ==========
+
+func finishLogin(c *gin.Context, t tenant, userToken string) {
+	user, err := fetchUserInfo(userToken)
+	if err != nil {
+		log.Printf("fetch user_info (%s): %v", t, err)
+		c.String(http.StatusInternalServerError, "fetch user info failed")
+		return
+	}
+	log.Printf("[auth] login ok via %s tenant_key=%s open_id=%s name=%s",
+		t, user.TenantKey, user.OpenID, user.Name)
+	if !isAllowedTenant(user.TenantKey) {
+		log.Printf("login denied: tenant_key %q not allowed", user.TenantKey)
+		c.Redirect(http.StatusFound, "/login?error=unauthorized_tenant")
+		return
+	}
+	localID, err := upsertLocalUser(user)
+	if err != nil {
+		c.String(http.StatusInternalServerError, "internal error")
+		return
+	}
+	createSession(c, localID)
+	c.Redirect(http.StatusFound, "/")
+}
+
+// ========== Token 兑换 ==========
+
+func exchangeCodeV2(t tenant, code string) (string, error) {
+	cfg := cfgFor(t)
+	secret, err := cfg.secret()
+	if err != nil {
+		return "", err
+	}
+	body, _ := json.Marshal(map[string]string{
+		"grant_type":    "authorization_code",
+		"client_id":     cfg.appID,
+		"client_secret": secret,
+		"code":          code,
+		"redirect_uri":  callbackURI(t),
+	})
+	req, _ := http.NewRequest(http.MethodPost, feishuTokenV2URL, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var r struct {
+		Code        int    `json:"code"`
+		AccessToken string `json:"access_token"`
+		ErrorDesc   string `json:"error_description"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return "", err
+	}
+	if r.Code != 0 || r.AccessToken == "" {
+		return "", fmt.Errorf("v2 token api code=%d desc=%s", r.Code, r.ErrorDesc)
+	}
+	return r.AccessToken, nil
+}
+
+func getAppAccessToken(t tenant) (string, error) {
+	cfg := cfgFor(t)
+	secret, err := cfg.secret()
+	if err != nil {
+		return "", err
+	}
+	body, _ := json.Marshal(map[string]string{"app_id": cfg.appID, "app_secret": secret})
+	req, _ := http.NewRequest(http.MethodPost, feishuAppTokenURL, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var r struct {
+		Code           int    `json:"code"`
+		Msg            string `json:"msg"`
+		AppAccessToken string `json:"app_access_token"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return "", err
+	}
+	if r.Code != 0 || r.AppAccessToken == "" {
+		return "", fmt.Errorf("app_token api code=%d msg=%s", r.Code, r.Msg)
+	}
+	return r.AppAccessToken, nil
+}
+
+func exchangeCodeV1(code, appAccessToken string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"grant_type": "authorization_code", "code": code})
+	req, _ := http.NewRequest(http.MethodPost, feishuTokenV1URL, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+appAccessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var r struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			AccessToken string `json:"access_token"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return "", err
+	}
+	if r.Code != 0 || r.Data.AccessToken == "" {
+		return "", fmt.Errorf("v1 token api code=%d msg=%s", r.Code, r.Msg)
+	}
+	return r.Data.AccessToken, nil
+}
+
+func fetchUserInfo(token string) (*FeishuUser, error) {
+	req, _ := http.NewRequest(http.MethodGet, feishuUserInfoURL, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var r struct {
+		Code int        `json:"code"`
+		Msg  string     `json:"msg"`
+		Data FeishuUser `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, err
+	}
+	if r.Code != 0 {
+		return nil, fmt.Errorf("user_info api code=%d msg=%s", r.Code, r.Msg)
+	}
+	return &r.Data, nil
+}
+
+// ========== 工具 ==========
+
+func setStateCookie(c *gin.Context, name, value string) {
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(name, value, stateCookieMaxAge, "/auth/feishu/", "", c.Request.TLS != nil, true)
+}
+
+func verifyAndClearStateCookie(c *gin.Context, name string) bool {
+	cookie, err := c.Cookie(name)
+	ok := err == nil && cookie != "" && c.Query("state") == cookie
+	c.SetCookie(name, "", -1, "/auth/feishu/", "", false, true)
+	return ok
+}
+
+func randomState(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func isAllowedTenant(tenantKey string) bool {
+	allowed := os.Getenv("FEISHU_ALLOWED_TENANT_KEYS")
+	if allowed == "" {
+		return true
+	}
+	for _, k := range strings.Split(allowed, ",") {
+		if strings.TrimSpace(k) == tenantKey {
+			return true
+		}
+	}
+	return false
+}
+
+// ---- 你需要按自己应用替换 ----
+
+func upsertLocalUser(u *FeishuUser) (string, error) {
+	// TODO: 复用项目现有 IAM/user service，不要另建平行用户体系。
+	// 必须按 tenant_key + (user_id OR open_id) 匹配；user_id 可能为空，open_id 是稳定兜底。
+	// FBIF 和 富的 用户都进同一张 users 表，靠 tenant_key 区分。
+	return u.OpenID, nil
+}
+
+func createSession(c *gin.Context, localUserID string) {
+	// TODO: 调用项目现有 session/RBAC 登录逻辑，设置自己的 HttpOnly session cookie。
+}

@@ -1,0 +1,5 @@
+feishu-login-guide/assets/secrets
+feishu-login-guide/learnings.jsonl
+.DS_Store
+__pycache__/
+*.zip

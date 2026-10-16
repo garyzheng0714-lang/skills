@@ -1,0 +1,37 @@
+// 会话兜底通道（feishu-login-guide 硬规则）：
+// 飞书端内/客户电脑可能丢 HttpOnly cookie，登录回跳时后端会在 URL hash 里
+// 附带 session_token——前端启动时立即消费、存本地、清地址栏；
+// 之后所有同源请求自动带 X-Session-Token，后端按 cookie → header 顺序解析。
+
+const STORAGE_KEY = 'fbif_session_token';
+
+/** 应用启动时调用一次：消费 /auth/callback#session_token=xxx 并清理地址栏 */
+export function consumeSessionTokenFromHash(): void {
+  const m = window.location.hash.match(/session_token=([^&]+)/);
+  if (!m) return;
+  localStorage.setItem(STORAGE_KEY, m[1]);
+  history.replaceState(null, '', window.location.pathname + window.location.search);
+}
+
+export function getSessionToken(): string | null {
+  return localStorage.getItem(STORAGE_KEY);
+}
+
+/** 账号密码登录成功后存下接口返回的 session_token（cookie 丢了时的兜底） */
+export function setSessionToken(token: string): void {
+  localStorage.setItem(STORAGE_KEY, token);
+}
+
+export function clearSessionToken(): void {
+  localStorage.removeItem(STORAGE_KEY);
+}
+
+/** 同源 API 请求统一出口：自动带 cookie 和 X-Session-Token */
+export function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  const token = getSessionToken();
+  if (token && !headers.has('X-Session-Token')) {
+    headers.set('X-Session-Token', token);
+  }
+  return fetch(input, { ...init, headers, credentials: 'include' });
+}

@@ -13,11 +13,7 @@
 
 ## 维护
 
-改完跑一遍检查，它会核对技能头信息、所有相对链接，并扫一遍有没有误写进去的回调地址、App ID、IP 这类敏感信息：
-
-```bash
-python3 feishu-anycross/scripts/check.py
-```
+改完在技能库根目录跑一遍 `python3 scripts/check.py`，见 [技能库首页](../README.md#加新技能)。
 
 新经验加进 `references/` 对应的文件，写清证据等级。回调地址、密钥、租户代码、员工信息一律不写，用 `<项目ID>` 这类占位符。
 

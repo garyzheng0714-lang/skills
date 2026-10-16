@@ -1,0 +1,1009 @@
+// 接飞书集成平台（AnyCross）单点登录，路线 A 统一接入模板（Node / TypeScript）。
+// 契约、接入步骤和合规测试见 feishu-login-guide 技能 templates/backend/anycross-sso/README.md；
+// 改了这个文件必须重跑 conformance/selftest.sh。行为与 go/sso.go.template 一一对应。
+//
+// 依赖：openid-client@6；Node 20+。处理函数是 (req, res, next) 形式，Express 直接挂，
+// 原生 http 自己传 next。
+
+import { createCipheriv, createDecipheriv, createHash, createHmac, createPublicKey, randomBytes, timingSafeEqual, verify } from 'node:crypto';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import * as oidc from 'openid-client';
+
+const LOGIN_PATH = '/auth/feishu/fbif/login';
+const CALLBACK_PATH = '/auth/feishu/fbif/callback';
+const LOGOUT_PATH = '/auth/feishu/logout';
+const ME_PATH = '/api/me';
+const BLOCKLIST_PATH = '/internal/auth/blocklist-changed';
+const ACCOUNT_PATH = '/auth/account/login';
+
+const SESSION_COOKIE = '__Host-fbif_sid';
+const TXN_COOKIE_PREFIX = '__Host-fbif_sso_';
+
+const MINUTE = 60_000;
+const SESSION_IDLE_MS = 30 * 24 * 60 * MINUTE;
+const TOUCH_EVERY_MS = 60 * MINUTE;
+const DEFAULT_CHECK_MS = 5 * MINUTE;
+const OUTAGE_GRACE_MS = 15 * MINUTE;
+const TXN_TTL_MS = 10 * MINUTE;
+const OUTAGE_BACKOFF_MS = 30_000;
+const DEFAULT_SYNC_GAP_MS = 30_000;
+const SYNC_ATTEMPTS = 4;
+const UPSTREAM_TIMEOUT_MS = 20_000;
+
+// 账号密码：同一账号 15 分钟内连错 5 次就锁到这 15 分钟结束。
+const ACCOUNT_FAIL_LIMIT = 5;
+const ACCOUNT_LOCK_MS = 15 * MINUTE;
+// 账号快照最多用这么久就重拉；不超过核对周期，停用、重置密码最晚一个核对周期加这么久生效。
+const ACCOUNTS_MAX_AGE_MS = MINUTE;
+
+/** 账号密码登录的人没有集成平台身份，company_code 记成这个，和 FBIF、富的分开。 */
+export const ACCOUNT_COMPANY_CODE = 'account';
+
+// 同一个人在 FBIF 和富的是两个不同的 sub，靠 company_code 区分。
+const ALLOWED_COMPANY_CODES = new Set([
+  'FJY632B9P3E', // FBIF
+  'FMZYRL01RNE', // 富的
+]);
+
+/** 集成平台给的身份。认人用 identityKey()，不要用邮箱：富的账号邮箱为空。 */
+export interface Identity {
+  company_code: string;
+  sub: string;
+  name: string;
+  email?: string;
+  picture?: string;
+}
+export const identityKey = (id: Identity) => `${id.company_code}:${id.sub}`;
+
+export interface User extends Identity {
+  id: string;
+}
+
+export interface Session {
+  idHash: string;
+  userId: string;
+  identity: Identity;
+  refreshSeal: string;
+  createdAt: number;
+  checkedAt: number;
+  lastSeenAt: number;
+  version: number;
+  /** true 是账号密码登录的会话：没有 refresh_token，不找集成平台核对，也不归停用名单管 */
+  account?: boolean;
+  /** 登录时的密码指纹（Account.credential），管理员重置密码后对不上，会话就下线 */
+  accountCredential?: string;
+}
+
+export interface BlockEntry {
+  reason: string;
+  since?: string;
+}
+export interface Blocklist {
+  revision: number;
+  syncedAt: number;
+  entries: Record<string, BlockEntry>;
+}
+
+export class ConflictError extends Error {}
+export class StaleBlocklistError extends Error {}
+export class NotAllowedError extends Error {}
+/** 账号或密码错（不区分是哪个） */
+export class AuthFailedError extends Error {}
+
+/** 会话和停用名单的存储。多实例部署必须用所有实例共享的库实现，踢人和拒绝登录才能所有实例一起生效。 */
+export interface Store {
+  createSession(s: Session): Promise<void>;
+  /** 找不到返回 null */
+  getSession(idHash: string): Promise<Session | null>;
+  /** 只在库里版本仍等于 expectVersion 时写入并把版本加一；会话已删除或已被别处改过抛 ConflictError */
+  updateSession(s: Session, expectVersion: number): Promise<void>;
+  /** 返回被删的会话，不存在返回 null */
+  deleteSession(idHash: string): Promise<Session | null>;
+  /** 删掉这些 sub 的全部会话并返回它们；账号密码会话（account=true）不归名单管，不删 */
+  deleteSessionsBySub(subs: Record<string, BlockEntry>): Promise<Session[]>;
+  /** 库里名单的版本；synced=false 表示从没成功同步过 */
+  blocklistRevision(): Promise<{ revision: number; synced: boolean }>;
+  /** 查一个 sub 在不在名单里，不在返回 null */
+  blockedEntry(sub: string): Promise<BlockEntry | null>;
+  /** 整份替换名单，但只在 b.revision 不小于库里版本时写入，否则抛 StaleBlocklistError；比较和写入必须原子（多实例时晚到的旧名单不能盖掉新名单） */
+  saveBlocklist(b: Blocklist): Promise<void>;
+}
+
+export interface Options {
+  store: Store;
+  /** 把身份对上本项目的用户（按 identityKey 查找或新建），返回本项目用户 ID；抛 NotAllowedError 表示本项目不让这个人进 */
+  onLogin(id: Identity): Promise<string>;
+  /**
+   * 外部供应商、兼职这类没有飞书的人的账号密码，可选。不填就用 SSO_ACCOUNTS_URL（集成平台工作流，见 remoteAccounts）；
+   * 那也没配就是没有账号，账号密码登录一律回「账号或密码错误」。账号登录同样经过 onLogin，company_code 是 'account'。
+   */
+  accounts?: Accounts;
+}
+
+/** 账号密码的来源。项目已有供应商账号表就自己实现，否则用集成平台工作流（SSO_ACCOUNTS_URL）。username 进来前已去空格、转小写 */
+export interface Accounts {
+  /** 账号存在、能用、密码对才返回账号；其余一律抛 AuthFailedError。别的错误（比如读不到账号表）让这次登录回 503 */
+  verify(username: string, password: string): Promise<Account>;
+  /**
+   * 账号还在、能用、密码指纹仍是 credential（登录时 verify 给的）返回 true。
+   * 登着的账号会话每个核对周期查一次，false 就踢下线：停用、到期、重置密码都靠它
+   */
+  active(username: string, credential: string): Promise<boolean>;
+}
+
+/** 账号密码登录的人。username 统一小写，就是 Identity.sub */
+export interface Account {
+  username: string;
+  name: string;
+  /** 密码的指纹，重置密码后必须变；不能是密码或哈希本身（它会存进会话） */
+  credential: string;
+}
+
+type Req = IncomingMessage & { ssoUser?: User; body?: unknown };
+type Res = ServerResponse;
+type Next = (err?: unknown) => void;
+type Handler = (req: Req, res: Res, next: Next) => void;
+
+export interface Sso {
+  /** 飞书登录、回调、账号密码登录、退出、/api/me、名单提醒六条路由；别的请求交给 next。挂在 body 解析中间件之前 */
+  routes: Handler;
+  /** 包住所有要登录的接口，包括下载、导出、长连接。没登录回 401 */
+  requireUser: Handler;
+  /** 给 HR、盖章、改权限、敏感导出：每次当场找集成平台核对，核对不了就拒绝；账号密码会话一律 403 */
+  requireFreshUser: Handler;
+}
+
+const REJECTED = Symbol('rejected');
+const UNAVAILABLE = Symbol('unavailable');
+const STORE_DOWN = Symbol('store-down');
+class DeniedError extends Error {}
+class TokenStaleError extends Error {}
+class RejectedError extends Error {}
+
+/**
+ * 读环境变量：SSO_ISSUER、SSO_CLIENT_ID、SSO_CLIENT_SECRET、SSO_REDIRECT_URL、SSO_BLOCKLIST_URL、SSO_TOKEN_KEY；
+ * 可选 SSO_ACCOUNTS_URL（账号密码，见 remoteAccounts）；SSO_CHECK_INTERVAL、SSO_SYNC_MIN_GAP（如 2s）只给合规测试用，生产留空。
+ */
+export async function createSso(opts: Options): Promise<Sso> {
+  const names = ['SSO_ISSUER', 'SSO_CLIENT_ID', 'SSO_CLIENT_SECRET', 'SSO_REDIRECT_URL', 'SSO_BLOCKLIST_URL', 'SSO_TOKEN_KEY'] as const;
+  const env = Object.fromEntries(names.map((k) => [k, (process.env[k] ?? '').trim()])) as Record<(typeof names)[number], string>;
+  const missing = names.filter((k) => !env[k]);
+  if (missing.length) throw new Error(`sso: missing env ${missing.join(', ')}`);
+  const redirect = new URL(env.SSO_REDIRECT_URL);
+  if (redirect.pathname !== CALLBACK_PATH) throw new Error(`sso: SSO_REDIRECT_URL must end with ${CALLBACK_PATH}`);
+  const key = Buffer.from(env.SSO_TOKEN_KEY, 'base64');
+  if (key.length !== 32) throw new Error('sso: SSO_TOKEN_KEY must be 32 random bytes in base64 (openssl rand -base64 32)');
+  const checkEveryMs = process.env.SSO_CHECK_INTERVAL ? parseDuration(process.env.SSO_CHECK_INTERVAL) : DEFAULT_CHECK_MS;
+  // 每次拉名单都算集成平台一次工作流运行（按月计费）：伪造的提醒再多，一个实例每 30 秒最多拉一次。
+  const syncGapMs = process.env.SSO_SYNC_MIN_GAP ? parseDuration(process.env.SSO_SYNC_MIN_GAP) : DEFAULT_SYNC_GAP_MS;
+
+  const issuer = new URL(env.SSO_ISSUER);
+  const config = await oidc.discovery(
+    issuer,
+    env.SSO_CLIENT_ID,
+    // 集成平台也声明了 HS256，只认 RS256，避免拿 client secret 伪造签名。
+    { id_token_signed_response_alg: 'RS256' },
+    oidc.ClientSecretBasic(env.SSO_CLIENT_SECRET),
+    { execute: issuer.protocol === 'http:' ? [oidc.allowInsecureRequests] : [], timeout: UPSTREAM_TIMEOUT_MS / 1000 },
+  );
+  const meta = config.serverMetadata();
+  if (!meta.userinfo_endpoint || !meta.revocation_endpoint || !meta.jwks_uri || !meta.token_endpoint) throw new Error('sso: discovery lacks token, userinfo, revocation or jwks endpoint');
+  const jwksUri = meta.jwks_uri;
+  const tokenUrl = meta.token_endpoint;
+  const basicAuth = 'Basic ' + Buffer.from(`${encodeURIComponent(env.SSO_CLIENT_ID)}:${encodeURIComponent(env.SSO_CLIENT_SECRET)}`).toString('base64');
+  const userInfoUrl = meta.userinfo_endpoint;
+  const { store } = opts;
+  const accountsUrl = (process.env.SSO_ACCOUNTS_URL ?? '').trim();
+  const accounts: Accounts | null = opts.accounts ?? (accountsUrl ? remoteAccounts(accountsUrl, redirect.origin, Math.min(ACCOUNTS_MAX_AGE_MS, checkEveryMs)) : null);
+
+  const seal = (purpose: string, plain: string) => {
+    const nonce = randomBytes(12);
+    const c = createCipheriv('aes-256-gcm', key, nonce).setAAD(Buffer.from(purpose));
+    const ct = Buffer.concat([c.update(plain, 'utf8'), c.final()]);
+    return Buffer.concat([nonce, ct, c.getAuthTag()]).toString('base64url');
+  };
+  const open = (purpose: string, sealed: string): string | null => {
+    try {
+      const raw = Buffer.from(sealed, 'base64url');
+      const d = createDecipheriv('aes-256-gcm', key, raw.subarray(0, 12)).setAAD(Buffer.from(purpose));
+      d.setAuthTag(raw.subarray(raw.length - 16));
+      return Buffer.concat([d.update(raw.subarray(12, raw.length - 16)), d.final()]).toString('utf8');
+    } catch {
+      return null;
+    }
+  };
+
+  const revoke = async (refreshToken: string | undefined) => {
+    if (!refreshToken) return;
+    try {
+      await oidc.tokenRevocation(config, refreshToken, { token_type_hint: 'refresh_token' });
+    } catch (e) {
+      console.log(`sso: revoke failed: ${describe(e)}`);
+    }
+  };
+
+  const userInfo = async (accessToken: string, wantSub: string) => {
+    const res = await fetch(userInfoUrl, { headers: { Authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+    if (res.status === 403) throw new DeniedError('userinfo HTTP 403');
+    if (res.status === 401) throw new TokenStaleError('userinfo HTTP 401');
+    if (res.status !== 200) throw new Error(`userinfo HTTP ${res.status}`);
+    const info = (await res.json()) as { sub?: string; name?: string; email?: string; picture?: string };
+    if (info.sub !== wantSub) throw new DeniedError('userinfo sub mismatch');
+    return info;
+  };
+
+  // openid-client 默认不验从令牌端点直接拿到的 id_token 签名（规范允许靠 TLS），它的验签开关又拒绝
+  // 2048 位以下的 RSA 公钥，而集成平台的签名公钥是 1024 位（2026-10-15 实测），所以这里用 node:crypto 自己验。
+  let jwks: { at: number; keys: Record<string, unknown>[] } = { at: 0, keys: [] };
+  const verifyIdTokenSignature = async (raw: string) => {
+    const [h, p, sig] = raw.split('.');
+    const header = JSON.parse(Buffer.from(h ?? '', 'base64url').toString()) as { alg?: string; kid?: string };
+    if (header.alg !== 'RS256' || !p || !sig) throw new Error(`id_token alg ${header.alg} not accepted`);
+    const find = () => jwks.keys.find((k) => k.kty === 'RSA' && (!header.kid || k.kid === header.kid));
+    if (!find() || Date.now() - jwks.at > 60 * MINUTE) {
+      const res = await fetch(jwksUri, { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+      if (res.status !== 200) throw new Error(`jwks HTTP ${res.status}`);
+      jwks = { at: Date.now(), keys: ((await res.json()) as { keys: Record<string, unknown>[] }).keys ?? [] };
+    }
+    const jwk = find();
+    if (!jwk) throw new Error(`id_token kid ${header.kid} not in jwks`);
+    const ok = verify('RSA-SHA256', Buffer.from(`${h}.${p}`), createPublicKey({ key: jwk as never, format: 'jwk' }), Buffer.from(sig, 'base64url'));
+    if (!ok) throw new Error('id_token signature invalid');
+  };
+
+  // 按 HTTP 状态判断：4xx 是集成平台明确拒绝（会话作废），其余算临时故障。
+  const refreshGrant = async (refreshToken: string) => {
+    const res = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { Authorization: basicAuth, 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+    const text = await res.text();
+    if (res.status >= 400 && res.status < 500) throw new RejectedError(`token HTTP ${res.status} ${text.slice(0, 120)}`);
+    if (res.status !== 200) throw new Error(`token HTTP ${res.status}`);
+    const body = JSON.parse(text) as { access_token?: string; refresh_token?: string };
+    if (!body.access_token) throw new Error('token response without access_token');
+    return { access_token: body.access_token, refresh_token: body.refresh_token };
+  };
+
+  // 登录时判断能不能放人。名单从没同步成功过，或者读不出来，一律不放：不按空名单放人。
+  const blocked = async (sub: string): Promise<string | null> => {
+    try {
+      if (!(await store.blocklistRevision()).synced) return '停用名单还没同步成功过';
+      return (await store.blockedEntry(sub))?.reason ?? null;
+    } catch (e) {
+      console.log(`sso: load blocklist: ${describe(e)}`);
+      return '名单读不出来';
+    }
+  };
+
+  // shortcut: 撤销失败只记日志不重试（令牌只在服务端，会话已删）；要做到必撤，就把加密的令牌连同删除一起写进待撤销表。
+  const endSession = async (idHash: string) => {
+    const s = await store.deleteSession(idHash);
+    retryAfter.delete(idHash);
+    if (s && !s.account) await revoke(open('refresh-token', s.refreshSeal) ?? undefined);
+  };
+
+  const retryAfter = new Map<string, number>();
+  const usedStates = new Map<string, number>();
+  const consumeState = (state: string, expires: number) => {
+    const now = Date.now();
+    for (const [k, exp] of usedStates) if (exp < now) usedStates.delete(k);
+    if (usedStates.has(state)) return false;
+    usedStates.set(state, expires);
+    return true;
+  };
+
+  // ---------- 登录 ----------
+
+  const handleLogin = (req: Req, res: Res) => {
+    const q = new URL(req.url ?? '/', 'http://x').searchParams;
+    const txn = { state: oidc.randomState(), nonce: oidc.randomNonce(), verifier: oidc.randomPKCECodeVerifier(), next: safeNext(q.get('next')), expires: Date.now() + TXN_TTL_MS };
+    // 登录事务加密放在发起登录的浏览器里：回调换了浏览器就对不上，防止把别人登进自己的账号。
+    setCookie(res, txnCookieName(txn.state), seal('login-txn', JSON.stringify(txn)), TXN_TTL_MS);
+    return oidc.calculatePKCECodeChallenge(txn.verifier).then((challenge) => {
+      const url = oidc.buildAuthorizationUrl(config, {
+        redirect_uri: env.SSO_REDIRECT_URL,
+        scope: 'openid profile email offline_access',
+        state: txn.state,
+        nonce: txn.nonce,
+        code_challenge: challenge,
+        code_challenge_method: 'S256',
+      });
+      redirectTo(res, url.href);
+    });
+  };
+
+  const handleCallback = async (req: Req, res: Res) => {
+    const q = new URL(req.url ?? '/', 'http://x').searchParams;
+    const fail = (code: string, why: string) => {
+      console.log(`sso: login failed (${code}): ${why}`);
+      redirectTo(res, `/login?error=${code}`);
+    };
+    const state = q.get('state') ?? '';
+    if (state.length < 16) return fail('expired', 'no state');
+    const cookie = readCookies(req)[txnCookieName(state)];
+    setCookie(res, txnCookieName(state), '', -1);
+    if (q.get('error')) return fail('denied', `idp error ${q.get('error')}`);
+    if (!cookie) return fail('expired', 'no login txn cookie');
+    const raw = open('login-txn', cookie);
+    const txn = raw ? (JSON.parse(raw) as { state: string; nonce: string; verifier: string; next: string; expires: number }) : null;
+    if (!txn || txn.state !== state || Date.now() > txn.expires) return fail('expired', 'login txn invalid');
+    // shortcut: 只防同一实例内的并发回调；多实例要防，就把登录事务放进共享库原子消费。
+    if (!consumeState(state, txn.expires)) return fail('expired', 'login txn already used');
+
+    let tokens: Awaited<ReturnType<typeof oidc.authorizationCodeGrant>>;
+    try {
+      const current = new URL(env.SSO_REDIRECT_URL);
+      current.search = q.toString();
+      // 授权码只换一次，失败也不重试：集成平台见到重放会把第一次发的令牌一并作废。
+      tokens = await oidc.authorizationCodeGrant(config, current, { pkceCodeVerifier: txn.verifier, expectedState: txn.state, expectedNonce: txn.nonce, idTokenExpected: true });
+      await verifyIdTokenSignature(tokens.id_token ?? '').catch(async (e) => {
+        await revoke(tokens.refresh_token);
+        throw e;
+      });
+    } catch (e) {
+      return fail('failed', `exchange or id_token: ${describe(e)}`);
+    }
+    const claims = tokens.claims() as unknown as Partial<Identity> | undefined;
+    let identity: Identity;
+    try {
+      if (!claims?.sub) throw Object.assign(new Error('id_token without sub'), { code: 'failed' });
+      if (!ALLOWED_COMPANY_CODES.has(claims.company_code ?? '')) throw Object.assign(new Error(`company_code ${claims.company_code} not allowed`), { code: 'unauthorized_tenant' });
+      if (!tokens.refresh_token) throw Object.assign(new Error('no refresh_token (offline_access not granted)'), { code: 'failed' });
+      const info = await userInfo(tokens.access_token, claims.sub).catch((e) => {
+        throw Object.assign(e, { code: e instanceof DeniedError ? 'denied' : 'failed' });
+      });
+      identity = { company_code: claims.company_code!, sub: claims.sub, name: claims.name || info.name || '', email: claims.email || info.email || '', picture: claims.picture || info.picture || '' };
+    } catch (e) {
+      await revoke(tokens.refresh_token);
+      return fail((e as { code?: string }).code ?? 'failed', describe(e));
+    }
+    const why = await blocked(identity.sub);
+    if (why) {
+      await revoke(tokens.refresh_token);
+      return fail('disabled', `sub ${identity.sub} refused: ${why}`);
+    }
+    let userId: string;
+    try {
+      userId = await opts.onLogin(identity);
+    } catch (e) {
+      await revoke(tokens.refresh_token);
+      return e instanceof NotAllowedError ? fail('unauthorized_tenant', `project refused ${identityKey(identity)}`) : fail('failed', `onLogin: ${describe(e)}`);
+    }
+
+    const sid = randomBytes(32).toString('base64url');
+    const now = Date.now();
+    const session: Session = { idHash: hashId(sid), userId, identity, refreshSeal: seal('refresh-token', tokens.refresh_token!), createdAt: now, checkedAt: now, lastSeenAt: now, version: 1 };
+    try {
+      await store.createSession(session);
+    } catch (e) {
+      await revoke(tokens.refresh_token);
+      return fail('failed', `create session: ${describe(e)}`);
+    }
+    // 名单同步先落名单再扫会话；这里先建会话再查一次名单，两边交错时不会漏掉人。
+    if (await blocked(identity.sub)) {
+      await endSession(session.idHash);
+      return fail('disabled', `sub ${identity.sub} blocked during login`);
+    }
+    setCookie(res, SESSION_COOKIE, sid, SESSION_IDLE_MS + TOUCH_EVERY_MS);
+    console.log(`sso: login ${identityKey(identity)} user=${userId}`);
+    redirectTo(res, txn.next || '/');
+  };
+
+  // ---------- 账号密码 ----------
+
+  // shortcut: 连错次数只在本实例内存里计数。
+  const fails = new Map<string, { n: number; first: number }>();
+  const allowAttempt = (name: string) => {
+    const f = fails.get(name);
+    return !f || f.n < ACCOUNT_FAIL_LIMIT || Date.now() - f.first > ACCOUNT_LOCK_MS;
+  };
+  const recordFailure = (name: string) => {
+    if (fails.size > 10_000) for (const [k, f] of fails) if (Date.now() - f.first > ACCOUNT_LOCK_MS) fails.delete(k);
+    let f = fails.get(name);
+    if (!f || Date.now() - f.first > ACCOUNT_LOCK_MS) fails.set(name, (f = { n: 0, first: Date.now() }));
+    f.n++;
+  };
+
+  // 给没有飞书的外部供应商、兼职：POST JSON {username, password}。
+  // 成功 200 并下发同一个会话 cookie；账号或密码错 401 auth_failed；连错太多 429 rate_limited。
+  const handleAccountLogin = async (req: Req, res: Res) => {
+    // 只收 JSON：跨站页面不经预检发不出这个类型，别人没法悄悄把你登进他的账号。
+    if ((req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase() !== 'application/json') return sendJson(res, 415, { error: 'json_required' });
+    let input: { username?: unknown; password?: unknown } = {};
+    try {
+      input = (req.body !== undefined ? req.body : JSON.parse(await readBody(req, 4096))) ?? {};
+    } catch {}
+    const name = (typeof input.username === 'string' ? input.username : '').trim().toLowerCase();
+    // 密码是系统生成的，不含空白；转发时常多带一个空格或换行。
+    const password = typeof input.password === 'string' ? input.password.trim() : '';
+    if (!allowAttempt(name)) return sendJson(res, 429, { error: 'rate_limited' });
+    let acct: Account;
+    try {
+      if (!accounts || !name || !password) throw new AuthFailedError();
+      acct = await accounts.verify(name, password);
+    } catch (e) {
+      if (!(e instanceof AuthFailedError)) {
+        console.log(`sso: account login ${JSON.stringify(name)}: ${describe(e)}`);
+        return sendJson(res, 503, { error: 'login_service_unavailable' });
+      }
+      recordFailure(name);
+      console.log(`sso: account login ${JSON.stringify(name)} refused`);
+      return sendJson(res, 401, { error: 'auth_failed' });
+    }
+    fails.delete(name);
+    const identity: Identity = { company_code: ACCOUNT_COMPANY_CODE, sub: acct.username.toLowerCase(), name: acct.name };
+    let userId: string;
+    try {
+      userId = await opts.onLogin(identity);
+    } catch (e) {
+      if (e instanceof NotAllowedError) {
+        console.log(`sso: project refused ${identityKey(identity)}`);
+        return sendJson(res, 401, { error: 'auth_failed' });
+      }
+      console.log(`sso: onLogin ${identityKey(identity)}: ${describe(e)}`);
+      return sendJson(res, 503, { error: 'login_service_unavailable' });
+    }
+    const sid = randomBytes(32).toString('base64url');
+    const now = Date.now();
+    try {
+      await store.createSession({ idHash: hashId(sid), userId, identity, refreshSeal: '', createdAt: now, checkedAt: now, lastSeenAt: now, version: 1, account: true, accountCredential: acct.credential });
+    } catch (e) {
+      console.log(`sso: create session: ${describe(e)}`);
+      return sendJson(res, 503, { error: 'login_service_unavailable' });
+    }
+    setCookie(res, SESSION_COOKIE, sid, SESSION_IDLE_MS + TOUCH_EVERY_MS);
+    console.log(`sso: login ${identityKey(identity)} user=${userId}`);
+    sendJson(res, 200, { ok: true });
+  };
+
+  // 每个核对周期查一次账号还在不在、到没到期、密码重置过没有；账号表读不到时普通接口最多再放行 15 分钟。
+  const checkAccount = async (sess: Session): Promise<Session | 401 | 503> => {
+    let active: boolean;
+    try {
+      active = accounts ? await accounts.active(sess.identity.sub, sess.accountCredential ?? '') : false;
+    } catch (e) {
+      console.log(`sso: check account ${sess.identity.sub}: ${describe(e)}`);
+      return Date.now() - sess.checkedAt < checkEveryMs + OUTAGE_GRACE_MS ? sess : 503;
+    }
+    if (!active) {
+      console.log(`sso: account ${sess.identity.sub} gone, expired or password reset, ending session`);
+      await endSession(sess.idHash).catch(() => {});
+      return 401;
+    }
+    const next = { ...sess, checkedAt: Date.now() };
+    try {
+      await store.updateSession(next, sess.version);
+    } catch {
+      try {
+        return (await store.getSession(sess.idHash)) ?? 401;
+      } catch {
+        return 503;
+      }
+    }
+    return { ...next, version: sess.version + 1 };
+  };
+
+  // ---------- 会话 ----------
+
+  const locks = new Map<string, Promise<unknown>>();
+  const withLock = <T>(id: string, fn: () => Promise<T>): Promise<T> => {
+    const run = (locks.get(id) ?? Promise.resolve()).then(fn, fn);
+    const tail = run.catch(() => {});
+    locks.set(id, tail);
+    tail.then(() => locks.get(id) === tail && locks.delete(id));
+    return run;
+  };
+
+  // 用 refresh_token 换新的 access_token，再调用户信息：集成平台的「禁止访问」拦在用户信息接口，
+  // 刷新本身照样成功，所以只看刷新成不成功没有用。
+  const check = (idHash: string, fresh: boolean) =>
+    withLock(idHash, async (): Promise<Session | typeof REJECTED | typeof UNAVAILABLE | typeof STORE_DOWN> => {
+      let cur: Session | null;
+      try {
+        cur = await store.getSession(idHash);
+      } catch {
+        return STORE_DOWN;
+      }
+      if (!cur) return REJECTED;
+      if (!fresh && Date.now() - cur.checkedAt < checkEveryMs) return cur;
+      const rt = open('refresh-token', cur.refreshSeal);
+      if (!rt) {
+        await endSession(idHash);
+        return REJECTED;
+      }
+      let next: Awaited<ReturnType<typeof refreshGrant>>;
+      try {
+        next = await refreshGrant(rt);
+      } catch (e) {
+        if (e instanceof RejectedError) {
+          console.log(`sso: refresh rejected for ${identityKey(cur.identity)}: ${describe(e)}`);
+          await store.deleteSession(idHash);
+          return REJECTED;
+        }
+        console.log(`sso: refresh unavailable: ${describe(e)}`);
+        return UNAVAILABLE;
+      }
+      const newRt = next.refresh_token || rt;
+      const updated: Session = { ...cur, refreshSeal: seal('refresh-token', newRt) };
+      try {
+        await userInfo(next.access_token, cur.identity.sub);
+      } catch (e) {
+        if (e instanceof DeniedError) {
+          console.log(`sso: ${identityKey(cur.identity)} denied by idp, ending session`);
+          await store.deleteSession(idHash);
+          await revoke(newRt);
+          return REJECTED;
+        }
+        const saved = await store.updateSession(updated, cur.version).then(() => null, (err) => err);
+        // 401 多半是别的实例同时刷新、把这个 access_token 顶掉了（刷新后旧的立即 401）：以库里为准，不踢人。
+        if (e instanceof TokenStaleError && saved instanceof ConflictError) {
+          const again = await store.getSession(idHash).catch(() => null);
+          if (again) return again;
+        }
+        console.log(`sso: userinfo unavailable: ${describe(e)}`);
+        return UNAVAILABLE;
+      }
+      updated.checkedAt = Date.now();
+      try {
+        await store.updateSession(updated, cur.version);
+      } catch {
+        // 这段时间里会话被踢了（或别的实例刚核对过）：以库里为准，晚到的刷新结果不能把会话救回来。
+        let again: Session | null;
+        try {
+          again = await store.getSession(idHash);
+        } catch {
+          return STORE_DOWN;
+        }
+        if (!again) {
+          await revoke(newRt);
+          return REJECTED;
+        }
+        return again;
+      }
+      return { ...updated, version: cur.version + 1 };
+    });
+
+  const authenticate = async (req: Req, fresh: boolean): Promise<Session | 401 | 403 | 503> => {
+    const sid = readCookies(req)[SESSION_COOKIE];
+    if (!sid) return 401;
+    let sess: Session | null;
+    let hit: BlockEntry | null = null;
+    try {
+      sess = await store.getSession(hashId(sid));
+      if (!sess) return 401;
+      // 每个请求都查名单：名单落库后、踢人前进程挂了，旧会话也进不来。
+      if (!sess.account) hit = await store.blockedEntry(sess.identity.sub);
+    } catch (e) {
+      console.log(`sso: load session or blocklist: ${describe(e)}`);
+      return 503;
+    }
+    // 滑动续期的时间每小时才写一次，多留一小时，保证 30 天没用才过期。
+    if (hit || Date.now() - sess.lastSeenAt > SESSION_IDLE_MS + TOUCH_EVERY_MS) {
+      await endSession(sess.idHash).catch(() => {});
+      return 401;
+    }
+    if (sess.account) {
+      // 敏感接口只认集成平台身份：账号密码没法当场找集成平台核对。
+      if (fresh) return 403;
+      if (Date.now() - sess.checkedAt < checkEveryMs) return sess;
+      return checkAccount(sess);
+    }
+    if (!fresh && Date.now() - sess.checkedAt < checkEveryMs) return sess;
+    const inGrace = !fresh && Date.now() - sess.checkedAt < checkEveryMs + OUTAGE_GRACE_MS;
+    if (!fresh && Date.now() < (retryAfter.get(sess.idHash) ?? 0)) return inGrace ? sess : 503;
+    const r = await check(sess.idHash, fresh);
+    if (r === REJECTED) return 401;
+    if (r === STORE_DOWN) return 503;
+    if (r === UNAVAILABLE) {
+      retryAfter.set(sess.idHash, Date.now() + OUTAGE_BACKOFF_MS);
+      if (!inGrace) return 503;
+      // 核对期间可能已被踢：放行前以库里为准。
+      try {
+        return (await store.getSession(sess.idHash)) ?? 401;
+      } catch {
+        return 503;
+      }
+    }
+    retryAfter.delete(sess.idHash);
+    return r;
+  };
+
+  const guard = (fresh: boolean): Handler => (req, res, next) => {
+    authenticate(req, fresh)
+      .then(async (sess) => {
+        if (sess === 401) {
+          setCookie(res, SESSION_COOKIE, '', -1);
+          return sendJson(res, 401, { error: 'login_required', login_url: LOGIN_PATH });
+        }
+        if (sess === 403) return sendJson(res, 403, { error: 'sso_required' });
+        if (sess === 503) return sendJson(res, 503, { error: 'login_service_unavailable' });
+        if (Date.now() - sess.lastSeenAt >= TOUCH_EVERY_MS) {
+          const touched = await store.updateSession({ ...sess, lastSeenAt: Date.now() }, sess.version).then(() => true, () => false);
+          if (touched) setCookie(res, SESSION_COOKIE, readCookies(req)[SESSION_COOKIE], SESSION_IDLE_MS + TOUCH_EVERY_MS);
+        }
+        req.ssoUser = { ...sess.identity, id: sess.userId };
+        next();
+      })
+      .catch(next);
+  };
+
+  // 只退出这个项目在这个浏览器里的会话；飞书和其他项目不受影响。
+  const handleLogout = async (req: Req, res: Res) => {
+    const sid = readCookies(req)[SESSION_COOKIE];
+    if (sid) {
+      try {
+        await endSession(hashId(sid));
+      } catch (e) {
+        console.log(`sso: logout: ${describe(e)}`);
+        return sendJson(res, 503, { error: 'logout_failed' });
+      }
+    }
+    setCookie(res, SESSION_COOKIE, '', -1);
+    sendJson(res, 200, { ok: true });
+  };
+
+  // ---------- 停用名单 ----------
+
+  let wake: (() => void) | null = null;
+  let pending = false;
+  const wakeSync = () => {
+    pending = true;
+    wake?.();
+  };
+
+  const syncBlocklist = async () => {
+    const res = await fetch(env.SSO_BLOCKLIST_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(30_000) });
+    const text = await res.text();
+    if (res.status !== 200) throw new Error(`blocklist HTTP ${res.status}`);
+    let got: { revision?: unknown; complete?: unknown; entries?: unknown };
+    try {
+      got = JSON.parse(text);
+    } catch {
+      throw new Error(`blocklist malformed: ${text.slice(0, 200)}`);
+    }
+    if (typeof got.revision !== 'number' || typeof got.complete !== 'boolean' || !Array.isArray(got.entries)) throw new Error(`blocklist malformed: ${text.slice(0, 200)}`);
+    if (!got.complete) throw new Error('blocklist incomplete, keeping the old one');
+    const next: Blocklist = { revision: got.revision, syncedAt: Date.now(), entries: {} };
+    for (const e of got.entries as { sub?: string; reason?: string; since?: string }[]) {
+      if (e.sub) next.entries[e.sub] = { reason: e.reason ?? '', since: e.since };
+    }
+    // 先落名单再踢人：落盘失败就不换名单，下次提醒再来；新登录也是按落盘的名单拒绝。
+    try {
+      await store.saveBlocklist(next);
+    } catch (e) {
+      if (!(e instanceof StaleBlocklistError)) throw e;
+      console.log(`sso: blocklist revision ${next.revision} is older than the stored one, ignored`);
+      return;
+    }
+    const kicked = await store.deleteSessionsBySub(next.entries);
+    for (const s of kicked) retryAfter.delete(s.idHash);
+    void (async () => {
+      for (const s of kicked) await revoke(open('refresh-token', s.refreshSeal) ?? undefined);
+    })();
+    console.log(`sso: blocklist revision ${next.revision}, ${Object.keys(next.entries).length} blocked, ${kicked.length} sessions ended`);
+  };
+
+  void (async function syncLoop() {
+    for (;;) {
+      if (!pending) await new Promise<void>((r) => (wake = r));
+      wake = null;
+      pending = false;
+      for (let attempt = 0; attempt < SYNC_ATTEMPTS; attempt++) {
+        try {
+          await syncBlocklist();
+          break;
+        } catch (e) {
+          console.log(`sso: blocklist sync attempt ${attempt + 1}: ${describe(e)}`);
+          await sleep((5 << attempt) * 1000);
+        }
+      }
+      await sleep(syncGapMs);
+    }
+  })();
+  wakeSync();
+
+  // 提醒不带名单、不需要密钥：假提醒最多让项目多读一次名单，名单只从集成平台读。
+  const handleBlocklistChanged = async (req: Req, res: Res) => {
+    let revision = 0;
+    try {
+      const body = req.body !== undefined ? req.body : JSON.parse(await readBody(req, 4096));
+      revision = Number((body as { revision?: unknown })?.revision) || 0;
+    } catch {}
+    const local = await store.blocklistRevision().catch(() => null);
+    if (!local || !local.synced || revision === 0 || revision > local.revision) wakeSync();
+    sendJson(res, 202, { ok: true });
+  };
+
+  const meHandler = guard(false);
+  const routes: Handler = (req, res, next) => {
+    const path = new URL(req.url ?? '/', 'http://x').pathname;
+    const route = `${req.method} ${path}`;
+    const run = (p: Promise<unknown> | unknown) => Promise.resolve(p).catch(next);
+    switch (route) {
+      case `GET ${LOGIN_PATH}`:
+        return void run(handleLogin(req, res));
+      case `GET ${CALLBACK_PATH}`:
+        return void run(handleCallback(req, res));
+      case `POST ${ACCOUNT_PATH}`:
+        return void run(handleAccountLogin(req, res));
+      case `POST ${LOGOUT_PATH}`:
+        return void run(handleLogout(req, res));
+      case `POST ${BLOCKLIST_PATH}`:
+        return void run(handleBlocklistChanged(req, res));
+      case `GET ${ME_PATH}`:
+        return meHandler(req, res, (err) => {
+          if (err) return next(err);
+          const u = req.ssoUser!;
+          sendJson(res, 200, { id: u.id, name: u.name, avatar_url: u.picture ?? '', company_code: u.company_code });
+        });
+    }
+    next();
+  };
+
+  return { routes, requireUser: guard(false), requireFreshUser: guard(true) };
+}
+
+// ---------- 小工具 ----------
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const hashId = (sid: string) => createHash('sha256').update(sid).digest('hex');
+const txnCookieName = (state: string) => TXN_COOKIE_PREFIX + state.slice(0, 16);
+const describe = (e: unknown) => (e instanceof oidc.ResponseBodyError ? `HTTP ${e.status} ${e.error}` : e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+
+function parseDuration(v: string): number {
+  const m = /^(\d+(?:\.\d+)?)(ms|s|m)$/.exec(v.trim());
+  if (!m) throw new Error(`sso: bad SSO_CHECK_INTERVAL ${v}`);
+  return Number(m[1]) * { ms: 1, s: 1000, m: 60_000 }[m[2] as 'ms' | 's' | 'm'];
+}
+
+/** 只接受本站路径，登录相关页面不算，和前端 safeNext 同一规则 */
+function safeNext(next: string | null): string {
+  if (!next || !/^\/(?![\/\\])/.test(next) || /[\x00-\x1f\x7f]/.test(next)) return '';
+  if (/^\/(login|auth)(\/|\?|#|$)/.test(next)) return '';
+  return next;
+}
+
+function readCookies(req: IncomingMessage): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of (req.headers.cookie ?? '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
+  }
+  return out;
+}
+
+function setCookie(res: ServerResponse, name: string, value: string, ttlMs: number) {
+  const maxAge = ttlMs < 0 ? 0 : Math.floor(ttlMs / 1000);
+  const prev = res.getHeader('Set-Cookie');
+  const list = Array.isArray(prev) ? prev : prev ? [String(prev)] : [];
+  res.setHeader('Set-Cookie', [...list, `${name}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`]);
+}
+
+function redirectTo(res: ServerResponse, location: string) {
+  res.statusCode = 302;
+  res.setHeader('Location', location);
+  res.setHeader('Cache-Control', 'no-store');
+  res.end();
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown) {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(JSON.stringify(body));
+}
+
+/** 只留前 limit 字节，多出来的读掉丢弃，内存不随上传量增长 */
+function readBody(req: IncomingMessage, limit: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (c: Buffer) => {
+      if (size < limit) chunks.push(c.subarray(0, limit - size));
+      size += c.length;
+    });
+    req.on('end', () => resolve(size > limit ? '' : Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+// ---------- 单实例文件存储 ----------
+
+/**
+ * 把会话和名单存在一个 JSON 文件里；每次改动先写盘，写盘失败就撤回内存里的改动。
+ * shortcut: 只适合单实例部署，多实例或已有数据库时用项目的库实现 Store。
+ */
+export class FileStore implements Store {
+  private path: string;
+  private data: { sessions: Record<string, Session>; blocklist: Blocklist } = { sessions: {}, blocklist: { revision: 0, syncedAt: 0, entries: {} } };
+
+  constructor(path: string) {
+    this.path = path;
+    if (existsSync(path)) this.data = JSON.parse(readFileSync(path, 'utf8'));
+  }
+
+  private commit(undo: () => void) {
+    try {
+      writeFileSync(this.path + '.tmp', JSON.stringify(this.data, null, 2), { mode: 0o600 });
+      renameSync(this.path + '.tmp', this.path);
+    } catch (e) {
+      undo();
+      throw e;
+    }
+  }
+
+  async createSession(s: Session) {
+    this.data.sessions[s.idHash] = s;
+    this.commit(() => delete this.data.sessions[s.idHash]);
+  }
+  async getSession(idHash: string) {
+    const s = this.data.sessions[idHash];
+    return s ? { ...s } : null;
+  }
+  async updateSession(s: Session, expectVersion: number) {
+    const cur = this.data.sessions[s.idHash];
+    if (!cur || cur.version !== expectVersion) throw new ConflictError('session changed or gone');
+    this.data.sessions[s.idHash] = { ...s, version: expectVersion + 1 };
+    this.commit(() => (this.data.sessions[s.idHash] = cur));
+  }
+  async deleteSession(idHash: string) {
+    const s = this.data.sessions[idHash];
+    if (!s) return null;
+    delete this.data.sessions[idHash];
+    this.commit(() => (this.data.sessions[idHash] = s));
+    return s;
+  }
+  async deleteSessionsBySub(subs: Record<string, BlockEntry>) {
+    const gone = Object.values(this.data.sessions).filter((s) => subs[s.identity.sub] && !s.account);
+    if (!gone.length) return [];
+    for (const s of gone) delete this.data.sessions[s.idHash];
+    this.commit(() => gone.forEach((s) => (this.data.sessions[s.idHash] = s)));
+    return gone;
+  }
+  async blocklistRevision() {
+    return { revision: this.data.blocklist.revision, synced: this.data.blocklist.syncedAt > 0 };
+  }
+  async blockedEntry(sub: string) {
+    const e = this.data.blocklist.entries[sub];
+    return e ? { ...e } : null;
+  }
+  async saveBlocklist(b: Blocklist) {
+    const prev = this.data.blocklist;
+    if (prev.syncedAt > 0 && b.revision < prev.revision) throw new StaleBlocklistError(`revision ${b.revision} < ${prev.revision}`);
+    this.data.blocklist = b;
+    this.commit(() => (this.data.blocklist = prev));
+  }
+}
+
+// ---------- 集成平台账号表 ----------
+
+interface RemoteAccount {
+  username: string;
+  name: string;
+  passwordHash: string;
+  /** null 是不过期 */
+  expiresAt: number | null;
+}
+
+const usable = (a: RemoteAccount) => a.expiresAt === null || Date.now() < a.expiresAt;
+
+/**
+ * 从集成平台工作流读账号（管理员在飞书多维表格里维护）：
+ *   POST SSO_ACCOUNTS_URL  {"system": "<本项目的源，如 https://tools.fbif.com>"}
+ *   → {"complete": true, "accounts": [{"username": "vendor-a", "name": "某供应商 张三", "password_hash": "hmac-sha256$<盐>$<hex>", "expires_at": "2026-12-31T16:00:00.000Z" 或 null}]}
+ * 工作流只给本项目能用、没停用的账号；到期由这里每次登录、核对时当场判。
+ * 内存里只留一份快照，过了 maxAgeMs 再用就先重拉（同一时刻只拉一次）；拉不到时用上一份，前提是它在 15 分钟内拉成功过。
+ * 不落盘：集成平台挂了飞书登录也一起挂，存一份到盘上没多大用。
+ */
+function remoteAccounts(url: string, system: string, maxAgeMs: number): Accounts {
+  let byName = new Map<string, RemoteAccount>();
+  let fetchedAt = 0; // 最近一次拉成功
+  let triedAt = 0; // 最近一次拉完（成功或失败）；失败后 maxAgeMs 内不再拉，别让每个请求都等一次超时
+  let lastErr = '';
+  let inflight: Promise<void> | null = null;
+
+  const fetchAccounts = async () => {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ system }), signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+    const text = await readLimited(res, 1 << 20);
+    if (res.status !== 200) throw new Error(`accounts HTTP ${res.status}`);
+    let got: { complete?: unknown; accounts?: unknown };
+    try {
+      got = JSON.parse(text);
+    } catch {
+      throw new Error(`accounts malformed: ${text.slice(0, 200)}`);
+    }
+    if (typeof got.complete !== 'boolean' || !Array.isArray(got.accounts)) throw new Error(`accounts malformed: ${text.slice(0, 200)}`);
+    if (!got.complete) throw new Error('accounts incomplete, keeping the old ones');
+    const next = new Map<string, RemoteAccount>();
+    for (const a of got.accounts as { username?: unknown; name?: unknown; password_hash?: unknown; expires_at?: unknown }[]) {
+      const name = (typeof a.username === 'string' ? a.username : '').trim().toLowerCase();
+      if (!name || next.has(name)) continue;
+      let expiresAt: number | null = null;
+      if (a.expires_at !== null && a.expires_at !== undefined) {
+        expiresAt = typeof a.expires_at === 'string' ? Date.parse(a.expires_at) : NaN;
+        if (Number.isNaN(expiresAt)) {
+          console.log(`sso: account ${name} has bad expires_at ${JSON.stringify(a.expires_at)}, skipped`);
+          continue;
+        }
+      }
+      next.set(name, { username: name, name: typeof a.name === 'string' ? a.name : '', passwordHash: typeof a.password_hash === 'string' ? a.password_hash : '', expiresAt });
+    }
+    return next;
+  };
+
+  // 返回能用的快照：过了 maxAgeMs 先重拉，并发的调用方等同一次拉取。
+  const current = async () => {
+    if (!inflight && Date.now() - triedAt >= maxAgeMs) {
+      inflight = fetchAccounts().then(
+        (next) => {
+          byName = next;
+          fetchedAt = triedAt = Date.now();
+        },
+        (e) => {
+          console.log(`sso: accounts fetch: ${describe(e)}`);
+          lastErr = describe(e);
+          triedAt = Date.now();
+        },
+      );
+      inflight.finally(() => (inflight = null));
+    }
+    if (inflight) await inflight;
+    if (!fetchedAt || Date.now() - fetchedAt > OUTAGE_GRACE_MS) throw new Error(`sso: accounts unavailable: ${lastErr}`);
+    return byName;
+  };
+
+  return {
+    async verify(username, password) {
+      const a = (await current()).get(username);
+      // 没这个账号也照样算一遍哈希，回得一样，探不出哪些账号存在。
+      const ok = checkPassword(a?.passwordHash ?? DUMMY_PASSWORD_HASH, password);
+      if (!a || !ok || !usable(a)) throw new AuthFailedError();
+      return { username: a.username, name: a.name, credential: credentialOf(a.passwordHash) };
+    },
+    async active(username, credential) {
+      const a = (await current()).get(username);
+      return !!a && usable(a) && credentialOf(a.passwordHash) === credential;
+    },
+  };
+}
+
+/** 最多读 limit 字节，超了算失败 */
+async function readLimited(res: Response, limit: number): Promise<string> {
+  const reader = res.body?.getReader();
+  const chunks: Uint8Array[] = [];
+  let n = 0;
+  while (reader) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.length;
+    if (n > limit) {
+      await reader.cancel();
+      throw new Error(`response over ${limit} bytes`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/** 存进会话的密码指纹：哈希变了（重置密码）指纹就变，又不把哈希本身存进会话 */
+const credentialOf = (passwordHash: string) => createHash('sha256').update(passwordHash).digest('hex').slice(0, 16);
+
+/** 谁也对不上的哈希，只用来让「没这个账号」和「密码错」走一样的路 */
+const DUMMY_PASSWORD_HASH = 'hmac-sha256$sso-dummy-salt$0000000000000000000000000000000000000000000000000000000000000000';
+
+const PASSWORD_HASH_FORMAT = /^hmac-sha256\$([A-Za-z0-9_-]{8,64})\$([0-9a-f]{64})$/;
+
+/**
+ * 校验 hmac-sha256$<盐>$<hex>：hex 是以盐为密钥对密码做 HMAC-SHA256；别的格式一律不认。
+ * 密码由系统生成（≥120 位随机），快速的带盐哈希就够了；慢哈希只对人自己起的密码有用。
+ */
+function checkPassword(encoded: string, password: string): boolean {
+  const m = PASSWORD_HASH_FORMAT.exec(encoded);
+  if (!m) return false;
+  const got = createHmac('sha256', m[1]).update(password, 'utf8').digest('hex');
+  return timingSafeEqual(Buffer.from(got), Buffer.from(m[2]));
+}

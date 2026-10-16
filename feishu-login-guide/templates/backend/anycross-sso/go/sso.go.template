@@ -1,0 +1,1410 @@
+// Package auth 接飞书集成平台（AnyCross）单点登录，路线 A 统一接入模板。
+// 契约、接入步骤和合规测试见 feishu-login-guide 技能 templates/backend/anycross-sso/README.md；
+// 改了这个文件必须重跑 conformance/selftest.sh。
+//
+// 依赖：github.com/coreos/go-oidc/v3、golang.org/x/oauth2；Go 1.24+（路由用方法前缀）。
+package auth
+
+import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/coreos/go-oidc/v3/oidc"
+	"golang.org/x/oauth2"
+)
+
+const (
+	loginPath     = "/auth/feishu/fbif/login"
+	callbackPath  = "/auth/feishu/fbif/callback"
+	logoutPath    = "/auth/feishu/logout"
+	mePath        = "/api/me"
+	blocklistPath = "/internal/auth/blocklist-changed"
+	accountPath   = "/auth/account/login"
+
+	sessionCookie   = "__Host-fbif_sid"
+	txnCookiePrefix = "__Host-fbif_sso_"
+
+	sessionIdle   = 30 * 24 * time.Hour
+	touchEvery    = time.Hour
+	defaultCheck  = 5 * time.Minute
+	outageGrace   = 15 * time.Minute
+	txnTTL        = 10 * time.Minute
+	outageBackoff = 30 * time.Second
+	defaultGap    = 30 * time.Second
+	syncAttempts  = 4
+	upstreamLimit = 20 * time.Second
+
+	// 账号密码：同一账号 15 分钟内连错 5 次就锁到这 15 分钟结束。
+	accountFailLimit = 5
+	accountLockFor   = 15 * time.Minute
+	// 账号快照最多用这么久就重拉；不超过核对周期，停用、重置密码最晚一个核对周期加这么久生效。
+	accountsMaxAge = time.Minute
+)
+
+// 账号密码登录的人没有集成平台身份，company_code 记成这个，和 FBIF、富的分开。
+const accountCompanyCode = "account"
+
+// 同一个人在 FBIF 和富的是两个不同的 sub，靠 company_code 区分。
+var allowedCompanyCodes = map[string]bool{
+	"FJY632B9P3E": true, // FBIF
+	"FMZYRL01RNE": true, // 富的
+}
+
+// Identity 是集成平台给的身份。认人用 Key()，不要用邮箱：富的账号邮箱为空。
+type Identity struct {
+	CompanyCode string `json:"company_code"`
+	Sub         string `json:"sub"`
+	Name        string `json:"name"`
+	Email       string `json:"email,omitempty"`
+	Picture     string `json:"picture,omitempty"`
+}
+
+func (i Identity) Key() string { return i.CompanyCode + ":" + i.Sub }
+
+// User 是已登录请求里的当前用户，用 CurrentUser(r) 取。
+type User struct {
+	ID string
+	Identity
+}
+
+type Session struct {
+	IDHash      string    `json:"id_hash"`
+	UserID      string    `json:"user_id"`
+	Identity    Identity  `json:"identity"`
+	RefreshSeal string    `json:"refresh_seal"`
+	CreatedAt   time.Time `json:"created_at"`
+	CheckedAt   time.Time `json:"checked_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+	Version     int64     `json:"version"`
+	// Account 为 true 是账号密码登录的会话：没有 refresh_token，不找集成平台核对，也不归停用名单管。
+	Account bool `json:"account,omitempty"`
+	// AccountCredential 是登录时的密码指纹（Account.Credential），管理员重置密码后对不上，会话就下线。
+	AccountCredential string `json:"account_credential,omitempty"`
+}
+
+type BlockEntry struct {
+	Reason string `json:"reason"`
+	Since  string `json:"since,omitempty"`
+}
+
+type Blocklist struct {
+	Revision int64                 `json:"revision"`
+	SyncedAt time.Time             `json:"synced_at"`
+	Entries  map[string]BlockEntry `json:"entries"`
+}
+
+var (
+	ErrConflict       = errors.New("sso: session changed or gone")
+	ErrStaleBlocklist = errors.New("sso: blocklist older than the stored one")
+	ErrNotAllowed     = errors.New("sso: user not allowed in this project")
+	ErrAuthFailed     = errors.New("sso: account or password wrong")
+)
+
+// Store 是会话和停用名单的存储。多实例部署必须用所有实例共享的库实现它，
+// 踢人和拒绝登录才能所有实例一起生效。
+type Store interface {
+	CreateSession(ctx context.Context, s Session) error
+	// GetSession 找不到返回 nil, nil。
+	GetSession(ctx context.Context, idHash string) (*Session, error)
+	// UpdateSession 只在库里版本仍等于 expectVersion 时写入，并把版本加一；
+	// 会话已删除或已被别处改过返回 ErrConflict。
+	UpdateSession(ctx context.Context, s Session, expectVersion int64) error
+	// DeleteSession 返回被删的会话，不存在返回 nil, nil。
+	DeleteSession(ctx context.Context, idHash string) (*Session, error)
+	// DeleteSessionsBySub 删掉这些 sub 的全部会话并返回它们；账号密码会话（Account=true）不归名单管，不删。
+	DeleteSessionsBySub(ctx context.Context, subs map[string]BlockEntry) ([]Session, error)
+	// BlocklistRevision 返回库里名单的版本；synced=false 表示从没成功同步过。
+	BlocklistRevision(ctx context.Context) (revision int64, synced bool, err error)
+	// BlockedEntry 查一个 sub 在不在名单里，不在返回 nil, nil。
+	BlockedEntry(ctx context.Context, sub string) (*BlockEntry, error)
+	// SaveBlocklist 整份替换名单，但只在 b.Revision 不小于库里版本时写入，否则返回 ErrStaleBlocklist。
+	// 比较和写入必须是一个原子操作：多实例时晚到的旧名单不能盖掉新名单。
+	SaveBlocklist(ctx context.Context, b Blocklist) error
+}
+
+type Options struct {
+	Store Store
+	// OnLogin 把身份对上本项目的用户（按 Identity.Key() 查找或新建），返回本项目用户 ID。
+	// 返回 ErrNotAllowed 表示本项目不让这个人进。
+	OnLogin func(ctx context.Context, id Identity) (userID string, err error)
+	// Accounts 是外部供应商、兼职这类没有飞书的人的账号密码，可选。不填就用 SSO_ACCOUNTS_URL（集成平台工作流，见 remoteAccounts）；
+	// 那也没配就是没有账号，账号密码登录一律回「账号或密码错误」。账号登录同样经过 OnLogin，company_code 是 "account"。
+	Accounts Accounts
+}
+
+// Accounts 是账号密码的来源。项目已有供应商账号表就自己实现，否则用集成平台工作流（SSO_ACCOUNTS_URL）。
+// username 进来前已去空格、转小写。
+type Accounts interface {
+	// Verify 账号存在、能用、密码对才返回 nil；其余一律 ErrAuthFailed，不区分「没这个账号」和「密码错」。
+	// 别的错误（比如读不到账号表）会让这次登录回 503。
+	Verify(ctx context.Context, username, password string) (Account, error)
+	// Active 账号还在、能用、密码指纹仍是 credential（登录时 Verify 给的）返回 true。
+	// 登着的账号会话每个核对周期查一次，false 就踢下线：停用、到期、重置密码都靠它。
+	Active(ctx context.Context, username, credential string) (bool, error)
+}
+
+// Account 是账号密码登录的人。Username 统一小写，就是 Identity.Sub。
+type Account struct {
+	Username string
+	Name     string
+	// Credential 是密码的指纹，重置密码后必须变；不能是密码或哈希本身（它会存进会话）。
+	Credential string
+}
+
+type SSO struct {
+	oauth        oauth2.Config
+	verifier     *oidc.IDTokenVerifier
+	userInfoURL  string
+	revokeURL    string
+	blocklistURL string
+	aead         cipher.AEAD
+	checkEvery   time.Duration
+	syncMinGap   time.Duration
+	store        Store
+	onLogin      func(context.Context, Identity) (string, error)
+	accounts     Accounts
+
+	locks      sync.Map // idHash → *sync.Mutex
+	retryAfter sync.Map // idHash → time.Time，集成平台故障时别每个请求都去刷新
+	usedStates sync.Map // state → 过期时间，同一个回调并发到达时只换一次码
+	syncWake   chan struct{}
+
+	failMu sync.Mutex
+	fails  map[string]*accountFails // 账号 → 连错次数；shortcut: 只在本实例内计数
+}
+
+type accountFails struct {
+	n     int
+	first time.Time
+}
+
+// New 读环境变量：SSO_ISSUER、SSO_CLIENT_ID、SSO_CLIENT_SECRET、SSO_REDIRECT_URL、
+// SSO_BLOCKLIST_URL、SSO_TOKEN_KEY；可选 SSO_ACCOUNTS_URL（账号密码，见 remoteAccounts）；
+// SSO_CHECK_INTERVAL、SSO_SYNC_MIN_GAP 只给合规测试用，生产留空。
+func New(ctx context.Context, opt Options) (*SSO, error) {
+	if opt.Store == nil || opt.OnLogin == nil {
+		return nil, errors.New("sso: Store and OnLogin are required")
+	}
+	env := map[string]string{}
+	var missing []string
+	for _, k := range []string{"SSO_ISSUER", "SSO_CLIENT_ID", "SSO_CLIENT_SECRET", "SSO_REDIRECT_URL", "SSO_BLOCKLIST_URL", "SSO_TOKEN_KEY"} {
+		env[k] = strings.TrimSpace(os.Getenv(k))
+		if env[k] == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("sso: missing env %s", strings.Join(missing, ", "))
+	}
+	redirect, err := url.Parse(env["SSO_REDIRECT_URL"])
+	if err != nil || redirect.Path != callbackPath {
+		return nil, fmt.Errorf("sso: SSO_REDIRECT_URL must end with %s", callbackPath)
+	}
+	key, err := base64.StdEncoding.DecodeString(env["SSO_TOKEN_KEY"])
+	if err != nil || len(key) != 32 {
+		return nil, errors.New("sso: SSO_TOKEN_KEY must be 32 random bytes in base64 (openssl rand -base64 32)")
+	}
+	block, _ := aes.NewCipher(key)
+	aead, _ := cipher.NewGCM(block)
+
+	checkEvery, err := envDuration("SSO_CHECK_INTERVAL", defaultCheck)
+	if err != nil {
+		return nil, err
+	}
+	// 每次拉名单都算集成平台一次工作流运行（按月计费）：伪造的提醒再多，一个实例每 30 秒最多拉一次。
+	syncMinGap, err := envDuration("SSO_SYNC_MIN_GAP", defaultGap)
+	if err != nil {
+		return nil, err
+	}
+
+	provider, err := oidc.NewProvider(ctx, env["SSO_ISSUER"])
+	if err != nil {
+		return nil, fmt.Errorf("sso: discovery: %w", err)
+	}
+	var meta struct {
+		Revocation string `json:"revocation_endpoint"`
+	}
+	if err := provider.Claims(&meta); err != nil || meta.Revocation == "" || provider.UserInfoEndpoint() == "" {
+		return nil, errors.New("sso: discovery lacks userinfo or revocation endpoint")
+	}
+	accounts := opt.Accounts
+	if u := strings.TrimSpace(os.Getenv("SSO_ACCOUNTS_URL")); accounts == nil && u != "" {
+		accounts = &remoteAccounts{url: u, system: originOf(redirect), maxAge: min(accountsMaxAge, checkEvery)}
+	}
+	endpoint := provider.Endpoint()
+	endpoint.AuthStyle = oauth2.AuthStyleInHeader
+
+	s := &SSO{
+		oauth: oauth2.Config{
+			ClientID:     env["SSO_CLIENT_ID"],
+			ClientSecret: env["SSO_CLIENT_SECRET"],
+			RedirectURL:  env["SSO_REDIRECT_URL"],
+			Endpoint:     endpoint,
+			Scopes:       []string{oidc.ScopeOpenID, "profile", "email", oidc.ScopeOfflineAccess},
+		},
+		// 集成平台也声明了 HS256，只认 RS256，避免拿 client secret 伪造签名。
+		verifier:     provider.Verifier(&oidc.Config{ClientID: env["SSO_CLIENT_ID"], SupportedSigningAlgs: []string{oidc.RS256}}),
+		userInfoURL:  provider.UserInfoEndpoint(),
+		revokeURL:    meta.Revocation,
+		blocklistURL: env["SSO_BLOCKLIST_URL"],
+		aead:         aead,
+		checkEvery:   checkEvery,
+		syncMinGap:   syncMinGap,
+		store:        opt.Store,
+		onLogin:      opt.OnLogin,
+		accounts:     accounts,
+		syncWake:     make(chan struct{}, 1),
+		fails:        map[string]*accountFails{},
+	}
+	go s.syncLoop()
+	s.wakeSync()
+	return s, nil
+}
+
+// Register 挂飞书登录、回调、账号密码登录、退出、/api/me 和名单提醒六条路由。
+func (s *SSO) Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET "+loginPath, s.handleLogin)
+	mux.HandleFunc("POST "+accountPath, s.handleAccountLogin)
+	mux.HandleFunc("GET "+callbackPath, s.handleCallback)
+	mux.HandleFunc("POST "+logoutPath, s.handleLogout)
+	mux.Handle("GET "+mePath, s.RequireUser(http.HandlerFunc(s.handleMe)))
+	mux.HandleFunc("POST "+blocklistPath, s.handleBlocklistChanged)
+}
+
+// RequireUser 包住所有要登录的接口，包括下载、导出、长连接。没登录回 401。
+func (s *SSO) RequireUser(next http.Handler) http.Handler { return s.require(next, false) }
+
+// RequireFreshUser 给 HR、盖章、改权限、敏感导出：每次当场找集成平台核对，核对不了就拒绝；账号密码会话一律 403。
+func (s *SSO) RequireFreshUser(next http.Handler) http.Handler { return s.require(next, true) }
+
+type userKey struct{}
+
+func CurrentUser(r *http.Request) *User {
+	u, _ := r.Context().Value(userKey{}).(*User)
+	return u
+}
+
+// ---------- 登录 ----------
+
+type loginTxn struct {
+	State    string `json:"state"`
+	Nonce    string `json:"nonce"`
+	Verifier string `json:"verifier"`
+	Next     string `json:"next"`
+	Expires  int64  `json:"expires"`
+}
+
+func (s *SSO) handleLogin(w http.ResponseWriter, r *http.Request) {
+	t := loginTxn{
+		State:    randToken(),
+		Nonce:    randToken(),
+		Verifier: oauth2.GenerateVerifier(),
+		Next:     safeNext(r.URL.Query().Get("next")),
+		Expires:  time.Now().Add(txnTTL).Unix(),
+	}
+	raw, _ := json.Marshal(t)
+	// 登录事务加密放在发起登录的浏览器里：回调换了浏览器就对不上，防止把别人登进自己的账号。
+	setCookie(w, txnCookieName(t.State), s.seal("login-txn", raw), txnTTL)
+	http.Redirect(w, r, s.oauth.AuthCodeURL(t.State, oidc.Nonce(t.Nonce), oauth2.S256ChallengeOption(t.Verifier)), http.StatusFound)
+}
+
+func (s *SSO) handleCallback(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	fail := func(code, why string, args ...any) {
+		log.Printf("sso: login failed (%s): "+why, append([]any{code}, args...)...)
+		http.Redirect(w, r, "/login?error="+code, http.StatusFound)
+	}
+	state := q.Get("state")
+	if len(state) < 16 {
+		fail("expired", "no state")
+		return
+	}
+	c, cookieErr := r.Cookie(txnCookieName(state))
+	setCookie(w, txnCookieName(state), "", -1)
+	if e := q.Get("error"); e != "" {
+		fail("denied", "idp error %s", e)
+		return
+	}
+	var t loginTxn
+	if cookieErr != nil {
+		fail("expired", "no login txn cookie")
+		return
+	}
+	raw, err := s.open("login-txn", c.Value)
+	if err != nil || json.Unmarshal(raw, &t) != nil || t.State != state || time.Now().Unix() > t.Expires {
+		fail("expired", "login txn invalid")
+		return
+	}
+	// shortcut: 只防同一实例内的并发回调；多实例要防，就把登录事务放进共享库原子消费。
+	if !s.consumeState(state, t.Expires) {
+		fail("expired", "login txn already used")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), upstreamLimit)
+	defer cancel()
+	// 授权码只换一次，失败也不重试：集成平台见到重放会把第一次发的令牌一并作废。
+	tok, err := s.oauth.Exchange(ctx, q.Get("code"), oauth2.VerifierOption(t.Verifier))
+	if err != nil {
+		fail("failed", "exchange: %s", oauthErr(err))
+		return
+	}
+	id, code, err := s.verifyLogin(ctx, tok, t.Nonce)
+	if err != nil {
+		s.revoke(ctx, tok.RefreshToken)
+		fail(code, "%v", err)
+		return
+	}
+	if why, blocked := s.blocked(ctx, id.Sub); blocked {
+		s.revoke(ctx, tok.RefreshToken)
+		fail("disabled", "sub %s refused: %s", id.Sub, why)
+		return
+	}
+	userID, err := s.onLogin(ctx, id)
+	if err != nil {
+		s.revoke(ctx, tok.RefreshToken)
+		if errors.Is(err, ErrNotAllowed) {
+			fail("unauthorized_tenant", "project refused %s", id.Key())
+		} else {
+			fail("failed", "OnLogin: %v", err)
+		}
+		return
+	}
+
+	sid := randToken()
+	now := time.Now()
+	sess := Session{IDHash: hashID(sid), UserID: userID, Identity: id, RefreshSeal: s.seal("refresh-token", []byte(tok.RefreshToken)), CreatedAt: now, CheckedAt: now, LastSeenAt: now, Version: 1}
+	if err := s.store.CreateSession(ctx, sess); err != nil {
+		s.revoke(ctx, tok.RefreshToken)
+		fail("failed", "create session: %v", err)
+		return
+	}
+	// 名单同步先落名单再扫会话；这里先建会话再查一次名单，两边交错时不会漏掉人。
+	if _, blocked := s.blocked(ctx, id.Sub); blocked {
+		s.endSession(ctx, sess.IDHash)
+		fail("disabled", "sub %s blocked during login", id.Sub)
+		return
+	}
+	setCookie(w, sessionCookie, sid, sessionIdle+touchEvery)
+	log.Printf("sso: login %s user=%s", id.Key(), userID)
+	next := t.Next
+	if next == "" {
+		next = "/"
+	}
+	http.Redirect(w, r, next, http.StatusFound)
+}
+
+func (s *SSO) verifyLogin(ctx context.Context, tok *oauth2.Token, nonce string) (Identity, string, error) {
+	rawID, _ := tok.Extra("id_token").(string)
+	idt, err := s.verifier.Verify(ctx, rawID)
+	if err != nil {
+		return Identity{}, "failed", fmt.Errorf("id_token: %w", err)
+	}
+	if idt.Nonce != nonce {
+		return Identity{}, "failed", errors.New("id_token nonce mismatch")
+	}
+	var claims Identity
+	if err := idt.Claims(&claims); err != nil || claims.Sub == "" {
+		return Identity{}, "failed", errors.New("id_token without sub")
+	}
+	if !allowedCompanyCodes[claims.CompanyCode] {
+		return Identity{}, "unauthorized_tenant", fmt.Errorf("company_code %q not allowed", claims.CompanyCode)
+	}
+	if tok.RefreshToken == "" {
+		return Identity{}, "failed", errors.New("no refresh_token (offline_access not granted)")
+	}
+	info, err := s.userInfo(ctx, tok.AccessToken, claims.Sub)
+	if errors.Is(err, errDenied) {
+		return Identity{}, "denied", err
+	}
+	if err != nil {
+		return Identity{}, "failed", err
+	}
+	if claims.Name == "" {
+		claims.Name = info.Name
+	}
+	if claims.Email == "" {
+		claims.Email = info.Email
+	}
+	if claims.Picture == "" {
+		claims.Picture = info.Picture
+	}
+	return claims, "", nil
+}
+
+// ---------- 会话 ----------
+
+var (
+	errRejected    = errors.New("sso: session rejected")
+	errUnavailable = errors.New("sso: idp unavailable")
+	errStore       = errors.New("sso: store unavailable")
+	errDenied      = errors.New("sso: idp denied this user")
+	errTokenStale  = errors.New("sso: access token superseded")
+)
+
+func (s *SSO) require(next http.Handler, fresh bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sess, status := s.authenticate(r.Context(), r, fresh)
+		if sess == nil {
+			if status == http.StatusUnauthorized {
+				setCookie(w, sessionCookie, "", -1)
+				writeJSON(w, status, map[string]any{"error": "login_required", "login_url": loginPath})
+			} else if status == http.StatusForbidden {
+				writeJSON(w, status, map[string]any{"error": "sso_required"})
+			} else {
+				writeJSON(w, status, map[string]any{"error": "login_service_unavailable"})
+			}
+			return
+		}
+		if time.Since(sess.LastSeenAt) >= touchEvery {
+			touched := *sess
+			touched.LastSeenAt = time.Now()
+			if s.store.UpdateSession(r.Context(), touched, sess.Version) == nil {
+				if c, err := r.Cookie(sessionCookie); err == nil {
+					setCookie(w, sessionCookie, c.Value, sessionIdle+touchEvery)
+				}
+			}
+		}
+		ctx := context.WithValue(r.Context(), userKey{}, &User{ID: sess.UserID, Identity: sess.Identity})
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (s *SSO) authenticate(ctx context.Context, r *http.Request, fresh bool) (*Session, int) {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil || c.Value == "" {
+		return nil, http.StatusUnauthorized
+	}
+	sess, err := s.store.GetSession(ctx, hashID(c.Value))
+	if err != nil {
+		log.Printf("sso: load session: %v", err)
+		return nil, http.StatusServiceUnavailable
+	}
+	if sess == nil {
+		return nil, http.StatusUnauthorized
+	}
+	// 滑动续期的时间每小时才写一次，多留一小时，保证 30 天没用才过期。
+	if time.Since(sess.LastSeenAt) > sessionIdle+touchEvery {
+		s.endSession(ctx, sess.IDHash)
+		return nil, http.StatusUnauthorized
+	}
+	if sess.Account {
+		// 敏感接口只认集成平台身份：账号密码没法当场找集成平台核对。
+		if fresh {
+			return nil, http.StatusForbidden
+		}
+		if time.Since(sess.CheckedAt) < s.checkEvery {
+			return sess, http.StatusOK
+		}
+		return s.checkAccount(ctx, sess)
+	}
+	// 每个请求都查名单：名单落库后、踢人前进程挂了，旧会话也进不来。
+	if e, err := s.store.BlockedEntry(ctx, sess.Identity.Sub); err != nil {
+		log.Printf("sso: load blocklist: %v", err)
+		return nil, http.StatusServiceUnavailable
+	} else if e != nil {
+		s.endSession(ctx, sess.IDHash)
+		return nil, http.StatusUnauthorized
+	}
+	if !fresh && time.Since(sess.CheckedAt) < s.checkEvery {
+		return sess, http.StatusOK
+	}
+	inGrace := !fresh && time.Since(sess.CheckedAt) < s.checkEvery+outageGrace
+	if until, ok := s.retryAfter.Load(sess.IDHash); ok && !fresh && time.Now().Before(until.(time.Time)) {
+		if inGrace {
+			return sess, http.StatusOK
+		}
+		return nil, http.StatusServiceUnavailable
+	}
+	cctx, cancel := context.WithTimeout(ctx, upstreamLimit)
+	defer cancel()
+	checked, err := s.check(cctx, sess.IDHash, fresh)
+	switch {
+	case err == nil:
+		s.retryAfter.Delete(sess.IDHash)
+		return checked, http.StatusOK
+	case errors.Is(err, errUnavailable):
+		s.retryAfter.Store(sess.IDHash, time.Now().Add(outageBackoff))
+		if !inGrace {
+			return nil, http.StatusServiceUnavailable
+		}
+		// 核对期间可能已被踢：放行前以库里为准。
+		again, gerr := s.store.GetSession(ctx, sess.IDHash)
+		if gerr != nil {
+			return nil, http.StatusServiceUnavailable
+		}
+		if again == nil {
+			return nil, http.StatusUnauthorized
+		}
+		return again, http.StatusOK
+	case errors.Is(err, errStore):
+		return nil, http.StatusServiceUnavailable
+	default:
+		return nil, http.StatusUnauthorized
+	}
+}
+
+// check 用 refresh_token 换新的 access_token，再调用户信息：集成平台的「禁止访问」拦在用户信息接口，
+// 刷新本身照样成功，所以只看刷新成不成功没有用。
+func (s *SSO) check(ctx context.Context, idHash string, fresh bool) (*Session, error) {
+	mu, _ := s.locks.LoadOrStore(idHash, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+	defer mu.(*sync.Mutex).Unlock()
+
+	cur, err := s.store.GetSession(ctx, idHash)
+	if err != nil {
+		return nil, errStore
+	}
+	if cur == nil {
+		return nil, errRejected
+	}
+	if !fresh && time.Since(cur.CheckedAt) < s.checkEvery {
+		return cur, nil
+	}
+	rt, err := s.open("refresh-token", cur.RefreshSeal)
+	if err != nil {
+		s.endSession(ctx, idHash)
+		return nil, errRejected
+	}
+	nt, err := s.oauth.TokenSource(ctx, &oauth2.Token{RefreshToken: string(rt), Expiry: time.Now().Add(-time.Minute)}).Token()
+	if err != nil {
+		if definiteRejection(err) {
+			log.Printf("sso: refresh rejected for %s: %s", cur.Identity.Key(), oauthErr(err))
+			s.store.DeleteSession(ctx, idHash)
+			s.locks.Delete(idHash)
+			return nil, errRejected
+		}
+		log.Printf("sso: refresh unavailable: %s", oauthErr(err))
+		return nil, errUnavailable
+	}
+	newRT := nt.RefreshToken
+	if newRT == "" {
+		newRT = string(rt)
+	}
+	next := *cur
+	next.RefreshSeal = s.seal("refresh-token", []byte(newRT))
+
+	_, uiErr := s.userInfo(ctx, nt.AccessToken, cur.Identity.Sub)
+	if errors.Is(uiErr, errDenied) {
+		log.Printf("sso: %s denied by idp, ending session", cur.Identity.Key())
+		s.store.DeleteSession(ctx, idHash)
+		s.locks.Delete(idHash)
+		s.revoke(ctx, newRT)
+		return nil, errRejected
+	}
+	if uiErr != nil {
+		saveErr := s.store.UpdateSession(ctx, next, cur.Version)
+		// 401 多半是别的实例同时刷新、把这个 access_token 顶掉了（刷新后旧的立即 401）：以库里为准，不踢人。
+		if errors.Is(uiErr, errTokenStale) && errors.Is(saveErr, ErrConflict) {
+			if again, gerr := s.store.GetSession(ctx, idHash); gerr == nil && again != nil {
+				return again, nil
+			}
+		}
+		log.Printf("sso: userinfo unavailable: %v", uiErr)
+		return nil, errUnavailable
+	}
+	next.CheckedAt = time.Now()
+	if err := s.store.UpdateSession(ctx, next, cur.Version); err != nil {
+		// 这段时间里会话被踢了（或别的实例刚核对过）：以库里为准，晚到的刷新结果不能把会话救回来。
+		again, gerr := s.store.GetSession(ctx, idHash)
+		if gerr != nil {
+			return nil, errStore
+		}
+		if again == nil {
+			s.revoke(ctx, newRT)
+			return nil, errRejected
+		}
+		return again, nil
+	}
+	next.Version = cur.Version + 1
+	return &next, nil
+}
+
+// ---------- 账号密码 ----------
+
+// handleAccountLogin 给没有飞书的外部供应商、兼职：POST JSON {username, password}。
+// 成功 200 并下发同一个会话 cookie；账号或密码错 401 auth_failed；连错太多 429 rate_limited。
+func (s *SSO) handleAccountLogin(w http.ResponseWriter, r *http.Request) {
+	// 只收 JSON：跨站页面不经预检发不出这个类型，别人没法悄悄把你登进他的账号。
+	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt != "application/json" {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]any{"error": "json_required"})
+		return
+	}
+	var in struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&in)
+	name := strings.ToLower(strings.TrimSpace(in.Username))
+	// 密码是系统生成的，不含空白；转发时常多带一个空格或换行。
+	in.Password = strings.TrimSpace(in.Password)
+	if !s.allowAttempt(name) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "rate_limited"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), upstreamLimit)
+	defer cancel()
+	var acct Account
+	err := ErrAuthFailed
+	if s.accounts != nil && name != "" && in.Password != "" {
+		acct, err = s.accounts.Verify(ctx, name, in.Password)
+	}
+	if err != nil {
+		if !errors.Is(err, ErrAuthFailed) {
+			log.Printf("sso: account login %q: %v", name, err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "login_service_unavailable"})
+			return
+		}
+		s.recordFailure(name)
+		log.Printf("sso: account login %q refused", name)
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "auth_failed"})
+		return
+	}
+	s.clearFailures(name)
+	id := Identity{CompanyCode: accountCompanyCode, Sub: strings.ToLower(acct.Username), Name: acct.Name}
+	userID, err := s.onLogin(ctx, id)
+	if errors.Is(err, ErrNotAllowed) {
+		log.Printf("sso: project refused %s", id.Key())
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "auth_failed"})
+		return
+	} else if err != nil {
+		log.Printf("sso: OnLogin %s: %v", id.Key(), err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "login_service_unavailable"})
+		return
+	}
+	sid := randToken()
+	now := time.Now()
+	sess := Session{IDHash: hashID(sid), UserID: userID, Identity: id, CreatedAt: now, CheckedAt: now, LastSeenAt: now, Version: 1, Account: true, AccountCredential: acct.Credential}
+	if err := s.store.CreateSession(ctx, sess); err != nil {
+		log.Printf("sso: create session: %v", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "login_service_unavailable"})
+		return
+	}
+	setCookie(w, sessionCookie, sid, sessionIdle+touchEvery)
+	log.Printf("sso: login %s user=%s", id.Key(), userID)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *SSO) allowAttempt(name string) bool {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	f := s.fails[name]
+	return f == nil || f.n < accountFailLimit || time.Since(f.first) > accountLockFor
+}
+
+func (s *SSO) recordFailure(name string) {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	if len(s.fails) > 10_000 {
+		for k, f := range s.fails {
+			if time.Since(f.first) > accountLockFor {
+				delete(s.fails, k)
+			}
+		}
+	}
+	f := s.fails[name]
+	if f == nil || time.Since(f.first) > accountLockFor {
+		f = &accountFails{first: time.Now()}
+		s.fails[name] = f
+	}
+	f.n++
+}
+
+func (s *SSO) clearFailures(name string) {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	delete(s.fails, name)
+}
+
+// checkAccount 每个核对周期查一次账号还在不在、到没到期、密码重置过没有；账号表读不到时普通接口最多再放行 15 分钟。
+func (s *SSO) checkAccount(ctx context.Context, sess *Session) (*Session, int) {
+	active, err := false, error(nil)
+	if s.accounts != nil {
+		active, err = s.accounts.Active(ctx, sess.Identity.Sub, sess.AccountCredential)
+	}
+	if err != nil {
+		log.Printf("sso: check account %s: %v", sess.Identity.Sub, err)
+		if time.Since(sess.CheckedAt) < s.checkEvery+outageGrace {
+			return sess, http.StatusOK
+		}
+		return nil, http.StatusServiceUnavailable
+	}
+	if !active {
+		log.Printf("sso: account %s gone, expired or password reset, ending session", sess.Identity.Sub)
+		s.endSession(ctx, sess.IDHash)
+		return nil, http.StatusUnauthorized
+	}
+	next := *sess
+	next.CheckedAt = time.Now()
+	if err := s.store.UpdateSession(ctx, next, sess.Version); err != nil {
+		again, gerr := s.store.GetSession(ctx, sess.IDHash)
+		if gerr != nil {
+			return nil, http.StatusServiceUnavailable
+		}
+		if again == nil {
+			return nil, http.StatusUnauthorized
+		}
+		return again, http.StatusOK
+	}
+	next.Version = sess.Version + 1
+	return &next, http.StatusOK
+}
+
+func (s *SSO) handleMe(w http.ResponseWriter, r *http.Request) {
+	u := CurrentUser(r)
+	writeJSON(w, http.StatusOK, map[string]any{"id": u.ID, "name": u.Name, "avatar_url": u.Picture, "company_code": u.CompanyCode})
+}
+
+// handleLogout 只退出这个项目在这个浏览器里的会话；飞书和其他项目不受影响。
+func (s *SSO) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+		ctx, cancel := context.WithTimeout(r.Context(), upstreamLimit)
+		err := s.endSession(ctx, hashID(c.Value))
+		cancel()
+		if err != nil {
+			log.Printf("sso: logout: %v", err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "logout_failed"})
+			return
+		}
+	}
+	setCookie(w, sessionCookie, "", -1)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// shortcut: 撤销失败只记日志不重试（令牌只在服务端，会话已删）；要做到必撤，就把加密的令牌连同删除一起写进待撤销表。
+func (s *SSO) endSession(ctx context.Context, idHash string) error {
+	sess, err := s.store.DeleteSession(ctx, idHash)
+	if err != nil {
+		return err
+	}
+	s.locks.Delete(idHash)
+	s.retryAfter.Delete(idHash)
+	if sess != nil {
+		if rt, err := s.open("refresh-token", sess.RefreshSeal); err == nil {
+			s.revoke(ctx, string(rt))
+		}
+	}
+	return nil
+}
+
+func (s *SSO) consumeState(state string, expires int64) bool {
+	now := time.Now().Unix()
+	s.usedStates.Range(func(k, v any) bool {
+		if v.(int64) < now {
+			s.usedStates.Delete(k)
+		}
+		return true
+	})
+	_, used := s.usedStates.LoadOrStore(state, expires)
+	return !used
+}
+
+// ---------- 停用名单 ----------
+
+// handleBlocklistChanged 收集成平台「名单变了」的提醒。提醒不带名单、不需要密钥：
+// 假提醒最多让项目多读一次名单，名单只从集成平台读。
+func (s *SSO) handleBlocklistChanged(w http.ResponseWriter, r *http.Request) {
+	var hint struct {
+		Revision int64 `json:"revision"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&hint)
+	local, synced, err := s.store.BlocklistRevision(r.Context())
+	if err != nil || !synced || hint.Revision == 0 || hint.Revision > local {
+		s.wakeSync()
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
+func (s *SSO) wakeSync() {
+	select {
+	case s.syncWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *SSO) syncLoop() {
+	for range s.syncWake {
+		for attempt := 0; attempt < syncAttempts; attempt++ {
+			err := s.syncBlocklist()
+			if err == nil {
+				break
+			}
+			log.Printf("sso: blocklist sync attempt %d: %v", attempt+1, err)
+			time.Sleep(time.Duration(5<<attempt) * time.Second)
+		}
+		time.Sleep(s.syncMinGap)
+	}
+}
+
+func (s *SSO) syncBlocklist() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, s.blocklistURL, strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("blocklist HTTP %d", resp.StatusCode)
+	}
+	var got struct {
+		Revision *int64 `json:"revision"`
+		Complete *bool  `json:"complete"`
+		Entries  []struct {
+			Sub    string `json:"sub"`
+			Reason string `json:"reason"`
+			Since  string `json:"since"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil || got.Revision == nil || got.Complete == nil || got.Entries == nil {
+		return fmt.Errorf("blocklist malformed: %.200s", body)
+	}
+	if !*got.Complete {
+		return errors.New("blocklist incomplete, keeping the old one")
+	}
+	next := Blocklist{Revision: *got.Revision, SyncedAt: time.Now(), Entries: map[string]BlockEntry{}}
+	for _, e := range got.Entries {
+		if e.Sub != "" {
+			next.Entries[e.Sub] = BlockEntry{Reason: e.Reason, Since: e.Since}
+		}
+	}
+	// 先落名单再踢人：落盘失败就不换名单，下次提醒再来；新登录也是按落盘的名单拒绝。
+	if err := s.store.SaveBlocklist(ctx, next); errors.Is(err, ErrStaleBlocklist) {
+		log.Printf("sso: blocklist revision %d is older than the stored one, ignored", next.Revision)
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("save blocklist: %w", err)
+	}
+	kicked, err := s.store.DeleteSessionsBySub(ctx, next.Entries)
+	if err != nil {
+		return fmt.Errorf("end blocked sessions: %w", err)
+	}
+	for _, sess := range kicked {
+		s.locks.Delete(sess.IDHash)
+		s.retryAfter.Delete(sess.IDHash)
+	}
+	go func() {
+		for _, sess := range kicked {
+			if rt, err := s.open("refresh-token", sess.RefreshSeal); err == nil {
+				rctx, cancel := context.WithTimeout(context.Background(), upstreamLimit)
+				s.revoke(rctx, string(rt))
+				cancel()
+			}
+		}
+	}()
+	log.Printf("sso: blocklist revision %d, %d blocked, %d sessions ended", next.Revision, len(next.Entries), len(kicked))
+	return nil
+}
+
+// blocked 在登录时判断能不能放人。名单从没同步成功过，或者读不出来，一律不放：不按空名单放人。
+func (s *SSO) blocked(ctx context.Context, sub string) (string, bool) {
+	_, synced, err := s.store.BlocklistRevision(ctx)
+	if err != nil {
+		log.Printf("sso: load blocklist: %v", err)
+		return "名单读不出来", true
+	}
+	if !synced {
+		return "停用名单还没同步成功过", true
+	}
+	e, err := s.store.BlockedEntry(ctx, sub)
+	if err != nil {
+		log.Printf("sso: load blocklist: %v", err)
+		return "名单读不出来", true
+	}
+	if e != nil {
+		return e.Reason, true
+	}
+	return "", false
+}
+
+// ---------- 集成平台接口 ----------
+
+type userInfo struct {
+	Sub     string `json:"sub"`
+	Name    string `json:"name"`
+	Email   string `json:"email"`
+	Picture string `json:"picture"`
+}
+
+func (s *SSO) userInfo(ctx context.Context, accessToken, wantSub string) (userInfo, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.userInfoURL, nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return userInfo{}, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	switch {
+	case resp.StatusCode == http.StatusForbidden:
+		return userInfo{}, fmt.Errorf("%w: userinfo HTTP 403", errDenied)
+	case resp.StatusCode == http.StatusUnauthorized:
+		return userInfo{}, fmt.Errorf("%w: userinfo HTTP 401", errTokenStale)
+	case resp.StatusCode != http.StatusOK:
+		return userInfo{}, fmt.Errorf("userinfo HTTP %d", resp.StatusCode)
+	}
+	var info userInfo
+	if err := json.Unmarshal(body, &info); err != nil {
+		return userInfo{}, fmt.Errorf("userinfo malformed: %w", err)
+	}
+	if info.Sub != wantSub {
+		return userInfo{}, fmt.Errorf("%w: userinfo sub mismatch", errDenied)
+	}
+	return info, nil
+}
+
+func (s *SSO) revoke(ctx context.Context, refreshToken string) {
+	if refreshToken == "" {
+		return
+	}
+	form := url.Values{"token": {refreshToken}, "token_type_hint": {"refresh_token"}}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, s.revokeURL, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(url.QueryEscape(s.oauth.ClientID), url.QueryEscape(s.oauth.ClientSecret))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("sso: revoke: %v", err)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("sso: revoke HTTP %d", resp.StatusCode)
+	}
+}
+
+func definiteRejection(err error) bool {
+	var re *oauth2.RetrieveError
+	return errors.As(err, &re) && re.Response != nil && re.Response.StatusCode >= 400 && re.Response.StatusCode < 500
+}
+
+func oauthErr(err error) string {
+	var re *oauth2.RetrieveError
+	if errors.As(err, &re) && re.Response != nil {
+		return fmt.Sprintf("HTTP %d %s", re.Response.StatusCode, re.ErrorCode)
+	}
+	return err.Error()
+}
+
+// ---------- 小工具 ----------
+
+func (s *SSO) seal(purpose string, plain []byte) string {
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		panic(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(s.aead.Seal(nonce, nonce, plain, []byte(purpose)))
+}
+
+func (s *SSO) open(purpose, sealed string) ([]byte, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(sealed)
+	if err != nil || len(raw) < s.aead.NonceSize() {
+		return nil, errors.New("sso: bad seal")
+	}
+	n := s.aead.NonceSize()
+	return s.aead.Open(nil, raw[:n], raw[n:], []byte(purpose))
+}
+
+func envDuration(key string, fallback time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("sso: bad %s %q", key, v)
+	}
+	return d, nil
+}
+
+func randToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func hashID(sid string) string {
+	sum := sha256.Sum256([]byte(sid))
+	return hex.EncodeToString(sum[:])
+}
+
+func txnCookieName(state string) string {
+	if len(state) > 16 {
+		state = state[:16]
+	}
+	return txnCookiePrefix + state
+}
+
+// safeNext 只接受本站路径，登录相关页面不算，和前端 safeNext 同一规则。
+func safeNext(next string) string {
+	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/\\") || strings.ContainsFunc(next, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		return ""
+	}
+	for _, p := range []string{"/login", "/auth"} {
+		if next == p || strings.HasPrefix(next, p+"/") || strings.HasPrefix(next, p+"?") || strings.HasPrefix(next, p+"#") {
+			return ""
+		}
+	}
+	return next
+}
+
+func setCookie(w http.ResponseWriter, name, value string, ttl time.Duration) {
+	maxAge := int(ttl.Seconds())
+	if ttl < 0 {
+		maxAge = -1
+	}
+	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: "/", MaxAge: maxAge, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+// ---------- 单实例文件存储 ----------
+
+// FileStore 把会话和名单存在一个 JSON 文件里；每次改动先写盘，写盘失败就撤回内存里的改动。
+// shortcut: 只适合单实例部署，多实例或已有数据库时用项目的库实现 Store。
+type FileStore struct {
+	path string
+	mu   sync.Mutex
+	data struct {
+		Sessions  map[string]Session `json:"sessions"`
+		Blocklist Blocklist          `json:"blocklist"`
+	}
+}
+
+func NewFileStore(path string) (*FileStore, error) {
+	fs := &FileStore{path: path}
+	raw, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if err == nil {
+		if err := json.Unmarshal(raw, &fs.data); err != nil {
+			return nil, fmt.Errorf("sso: %s: %w", path, err)
+		}
+	}
+	if fs.data.Sessions == nil {
+		fs.data.Sessions = map[string]Session{}
+	}
+	if fs.data.Blocklist.Entries == nil {
+		fs.data.Blocklist.Entries = map[string]BlockEntry{}
+	}
+	return fs, nil
+}
+
+func (fs *FileStore) commit(undo func()) error {
+	raw, err := json.MarshalIndent(fs.data, "", "  ")
+	if err == nil {
+		tmp := fs.path + ".tmp"
+		if err = os.WriteFile(tmp, raw, 0o600); err == nil {
+			err = os.Rename(tmp, fs.path)
+		}
+	}
+	if err != nil {
+		undo()
+	}
+	return err
+}
+
+func (fs *FileStore) CreateSession(_ context.Context, s Session) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.data.Sessions[s.IDHash] = s
+	return fs.commit(func() { delete(fs.data.Sessions, s.IDHash) })
+}
+
+func (fs *FileStore) GetSession(_ context.Context, idHash string) (*Session, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	s, ok := fs.data.Sessions[idHash]
+	if !ok {
+		return nil, nil
+	}
+	return &s, nil
+}
+
+func (fs *FileStore) UpdateSession(_ context.Context, s Session, expectVersion int64) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	cur, ok := fs.data.Sessions[s.IDHash]
+	if !ok || cur.Version != expectVersion {
+		return ErrConflict
+	}
+	s.Version = expectVersion + 1
+	fs.data.Sessions[s.IDHash] = s
+	return fs.commit(func() { fs.data.Sessions[s.IDHash] = cur })
+}
+
+func (fs *FileStore) DeleteSession(_ context.Context, idHash string) (*Session, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	s, ok := fs.data.Sessions[idHash]
+	if !ok {
+		return nil, nil
+	}
+	delete(fs.data.Sessions, idHash)
+	if err := fs.commit(func() { fs.data.Sessions[idHash] = s }); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (fs *FileStore) DeleteSessionsBySub(_ context.Context, subs map[string]BlockEntry) ([]Session, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	var gone []Session
+	for id, s := range fs.data.Sessions {
+		if _, ok := subs[s.Identity.Sub]; ok && !s.Account {
+			gone = append(gone, s)
+			delete(fs.data.Sessions, id)
+		}
+	}
+	if len(gone) == 0 {
+		return nil, nil
+	}
+	if err := fs.commit(func() {
+		for _, s := range gone {
+			fs.data.Sessions[s.IDHash] = s
+		}
+	}); err != nil {
+		return nil, err
+	}
+	return gone, nil
+}
+
+func (fs *FileStore) BlocklistRevision(_ context.Context) (int64, bool, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.data.Blocklist.Revision, !fs.data.Blocklist.SyncedAt.IsZero(), nil
+}
+
+func (fs *FileStore) BlockedEntry(_ context.Context, sub string) (*BlockEntry, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	e, ok := fs.data.Blocklist.Entries[sub]
+	if !ok {
+		return nil, nil
+	}
+	return &e, nil
+}
+
+func (fs *FileStore) SaveBlocklist(_ context.Context, b Blocklist) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	prev := fs.data.Blocklist
+	if !prev.SyncedAt.IsZero() && b.Revision < prev.Revision {
+		return ErrStaleBlocklist
+	}
+	fs.data.Blocklist = b
+	return fs.commit(func() { fs.data.Blocklist = prev })
+}
+
+// ---------- 集成平台账号表 ----------
+
+// remoteAccounts 从集成平台工作流读账号（管理员在飞书多维表格里维护）：
+//
+//	POST SSO_ACCOUNTS_URL  {"system": "<本项目的源，如 https://tools.fbif.com>"}
+//	→ {"complete": true, "accounts": [{"username": "vendor-a", "name": "某供应商 张三", "password_hash": "hmac-sha256$<盐>$<hex>", "expires_at": "2026-12-31T16:00:00.000Z" 或 null}]}
+//
+// 工作流只给本项目能用、没停用的账号；到期由这里每次登录、核对时当场判。
+// 内存里只留一份快照，过了 maxAge 再用就先重拉（同一时刻只拉一次）；拉不到时用上一份，前提是它在 15 分钟内拉成功过。
+// 不落盘：集成平台挂了飞书登录也一起挂，存一份到盘上没多大用。
+type remoteAccounts struct {
+	url    string
+	system string
+	maxAge time.Duration
+
+	mu        sync.Mutex
+	byName    map[string]remoteAccount
+	fetchedAt time.Time     // 最近一次拉成功
+	triedAt   time.Time     // 最近一次拉完（成功或失败）；失败后 maxAge 内不再拉，别让每个请求都等一次超时
+	lastErr   error         // 最近一次失败的原因
+	inflight  chan struct{} // 正在拉；拉完关掉
+}
+
+type remoteAccount struct {
+	username     string
+	name         string
+	passwordHash string
+	expiresAt    *time.Time // nil 是不过期
+}
+
+func (a remoteAccount) usable() bool {
+	return a.expiresAt == nil || time.Now().Before(*a.expiresAt)
+}
+
+func (ra *remoteAccounts) Verify(ctx context.Context, username, password string) (Account, error) {
+	byName, err := ra.current(ctx)
+	if err != nil {
+		return Account{}, err
+	}
+	a, ok := byName[username]
+	// 没这个账号也照样算一遍哈希，回得一样，探不出哪些账号存在。
+	hash := dummyPasswordHash
+	if ok {
+		hash = a.passwordHash
+	}
+	match := checkPassword(hash, password)
+	if !ok || !match || !a.usable() {
+		return Account{}, ErrAuthFailed
+	}
+	return Account{Username: a.username, Name: a.name, Credential: credentialOf(a.passwordHash)}, nil
+}
+
+func (ra *remoteAccounts) Active(ctx context.Context, username, credential string) (bool, error) {
+	byName, err := ra.current(ctx)
+	if err != nil {
+		return false, err
+	}
+	a, ok := byName[username]
+	return ok && a.usable() && credentialOf(a.passwordHash) == credential, nil
+}
+
+// current 返回能用的快照：过了 maxAge 先重拉，并发的调用方等同一次拉取。
+func (ra *remoteAccounts) current(ctx context.Context) (map[string]remoteAccount, error) {
+	ra.mu.Lock()
+	if ra.inflight == nil && time.Since(ra.triedAt) >= ra.maxAge {
+		ra.inflight = make(chan struct{})
+		go ra.refresh(ra.inflight)
+	}
+	wait := ra.inflight
+	ra.mu.Unlock()
+	if wait != nil {
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
+	if ra.fetchedAt.IsZero() || time.Since(ra.fetchedAt) > outageGrace {
+		return nil, fmt.Errorf("sso: accounts unavailable: %v", ra.lastErr)
+	}
+	return ra.byName, nil
+}
+
+// refresh 用自己的超时，不跟着某个请求取消：等着的调用方共用这一次结果。
+func (ra *remoteAccounts) refresh(done chan struct{}) {
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamLimit)
+	defer cancel()
+	byName, err := ra.fetch(ctx)
+	if err != nil {
+		log.Printf("sso: accounts fetch: %v", err)
+	}
+	ra.mu.Lock()
+	ra.triedAt = time.Now()
+	if err == nil {
+		ra.byName, ra.fetchedAt = byName, ra.triedAt
+	} else {
+		ra.lastErr = err
+	}
+	ra.inflight = nil
+	ra.mu.Unlock()
+	close(done)
+}
+
+func (ra *remoteAccounts) fetch(ctx context.Context) (map[string]remoteAccount, error) {
+	reqBody, _ := json.Marshal(map[string]string{"system": ra.system})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, ra.url, strings.NewReader(string(reqBody)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("accounts HTTP %d", resp.StatusCode)
+	}
+	var got struct {
+		Complete *bool `json:"complete"`
+		Accounts []struct {
+			Username     string  `json:"username"`
+			Name         string  `json:"name"`
+			PasswordHash string  `json:"password_hash"`
+			ExpiresAt    *string `json:"expires_at"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil || got.Complete == nil || got.Accounts == nil {
+		return nil, fmt.Errorf("accounts malformed: %.200s", body)
+	}
+	if !*got.Complete {
+		return nil, errors.New("accounts incomplete, keeping the old ones")
+	}
+	byName := map[string]remoteAccount{}
+	for _, a := range got.Accounts {
+		name := strings.ToLower(strings.TrimSpace(a.Username))
+		if _, dup := byName[name]; name == "" || dup {
+			continue
+		}
+		acct := remoteAccount{username: name, name: a.Name, passwordHash: a.PasswordHash}
+		if a.ExpiresAt != nil {
+			t, err := time.Parse(time.RFC3339, *a.ExpiresAt)
+			if err != nil {
+				log.Printf("sso: account %s has bad expires_at %q, skipped", name, *a.ExpiresAt)
+				continue
+			}
+			acct.expiresAt = &t
+		}
+		byName[name] = acct
+	}
+	return byName, nil
+}
+
+// originOf 是 scheme://host[:port]（默认端口省掉，和浏览器的 origin 写法一样），工作流按它认是哪个项目。
+func originOf(u *url.URL) string {
+	o := strings.ToLower(u.Scheme + "://" + u.Host)
+	return strings.TrimSuffix(o, map[string]string{"https": ":443", "http": ":80"}[strings.ToLower(u.Scheme)])
+}
+
+// credentialOf 是存进会话的密码指纹：哈希变了（重置密码）指纹就变，又不把哈希本身存进会话。
+func credentialOf(passwordHash string) string {
+	sum := sha256.Sum256([]byte(passwordHash))
+	return hex.EncodeToString(sum[:8])
+}
+
+// dummyPasswordHash 是一个谁也对不上的哈希，只用来让「没这个账号」和「密码错」走一样的路。
+const dummyPasswordHash = "hmac-sha256$sso-dummy-salt$0000000000000000000000000000000000000000000000000000000000000000"
+
+var passwordHashFormat = regexp.MustCompile(`^hmac-sha256\$([A-Za-z0-9_-]{8,64})\$([0-9a-f]{64})$`)
+
+// checkPassword 校验 hmac-sha256$<盐>$<hex>：hex 是以盐为密钥对密码做 HMAC-SHA256；别的格式一律不认。
+// 密码由系统生成（≥120 位随机），快速的带盐哈希就够了；慢哈希只对人自己起的密码有用。
+func checkPassword(encoded, password string) bool {
+	m := passwordHashFormat.FindStringSubmatch(encoded)
+	if m == nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(m[1]))
+	mac.Write([]byte(password))
+	return subtle.ConstantTimeCompare([]byte(hex.EncodeToString(mac.Sum(nil))), []byte(m[2])) == 1
+}
