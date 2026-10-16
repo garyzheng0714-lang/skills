@@ -1,1 +1,0 @@
-cd /Users/macmini_gary/.codex/skills/aliyun-ssh && ./scripts/bootstrap_aliyun_ssh.sh
