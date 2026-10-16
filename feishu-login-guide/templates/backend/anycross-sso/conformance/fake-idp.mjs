@@ -1,8 +1,9 @@
 // 假的飞书集成平台：照 2026-10-15 实测的集成平台行为做，供合规测试用。
 // 实测行为：刷新会轮换 refresh_token 但旧的仍可用；刷新后上一个 access_token 立即 401；
 // 刷新不返回 id_token；被「禁止访问」的人刷新照样成功、调用户信息 403；授权码重放会作废第一次发的令牌。
-// 账号表（POST /accounts）照账号读取工作流的约定：按请求里的 system 只给那个项目的账号；
-// 停用的不给，到期的照给（到期由项目自己判）。
+// 同一个服务器上还有假的飞书开放平台多维表格接口（/open-apis/…），照 2026-10-16 实测：
+// 查询（search）里文本格子是分段数组、空格子不出现、「是」完全相等但不分大小写；按 ID 取（get）文本是纯字符串、
+// 空格子是 null、行不在回 1254043；batch_update 只改给了的列；datetime 是毫秒数。
 import { createHash, createHmac, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { createServer } from 'node:http';
 
@@ -35,14 +36,7 @@ export async function startFakeIdp() {
     tokenCallsByCode: new Map(),
     revoked: [],
     blocklistPulls: 0,
-    // 账号表：测试直接改这几项。accountsBody 不为 null 时原样回它（模拟坏 JSON、complete:false）
-    accountsSystem: '',
-    accountList: [],
-    accountsStatus: 200,
-    accountsBody: null,
-    accountsDelayMs: 0,
-    accountsPulls: 0,
-    accountsRequests: [],
+    feishu: fakeFeishu(),
 
     addClient(id, secret, redirectUri) {
       this.clients.set(id, { secret, redirectUri });
@@ -137,6 +131,7 @@ export async function startFakeIdp() {
   const server = createServer(async (req, res) => {
     const u = new URL(req.url, idp.url);
     const raw = await readBody(req);
+    if (u.pathname.startsWith('/open-apis/')) return idp.feishu.handle(req.method, u, req.headers.authorization, raw, (status, body) => send(res, status, body));
     const form = new URLSearchParams(raw);
     switch (`${req.method} ${u.pathname}`) {
       case 'GET /.well-known/openid-configuration':
@@ -224,18 +219,6 @@ export async function startFakeIdp() {
         if (r) r.revoked = true;
         return send(res, 200, {});
       }
-      case 'POST /accounts': {
-        idp.accountsPulls += 1;
-        let system = null;
-        try {
-          system = JSON.parse(raw).system;
-        } catch {}
-        idp.accountsRequests.push({ contentType: req.headers['content-type'] || '', system });
-        if (idp.accountsDelayMs) await new Promise((r) => setTimeout(r, idp.accountsDelayMs));
-        if (idp.accountsStatus !== 200) return send(res, idp.accountsStatus, { error: 'down' });
-        if (idp.accountsBody !== null) return send(res, 200, idp.accountsBody);
-        return send(res, 200, { complete: true, accounts: system === idp.accountsSystem ? idp.accountList : [] });
-      }
       case 'POST /blocklist':
         idp.blocklistPulls += 1;
         if (idp.blocklistStatus !== 200) return send(res, idp.blocklistStatus, { error: 'down' });
@@ -249,4 +232,171 @@ export async function startFakeIdp() {
   idp.url = `http://127.0.0.1:${server.address().port}`;
   idp.close = () => new Promise((resolve) => server.close(resolve));
   return idp;
+}
+
+// ---------- 假的飞书开放平台（多维表格） ----------
+
+const FIELD_TYPES = { text: 1, number: 2, select: 3, datetime: 5, checkbox: 7, link: 18 };
+
+function fakeFeishu() {
+  const fs = {
+    appId: '',
+    appSecret: '',
+    tokens: new Map(), // tenant_access_token → 过期时间
+    tables: new Map(), // table_id → { app, fields: [{field_name, type, field_id, property}], rows: Map(record_id → {列名: 值}) }
+    // 按表注入故障：'error' 回 500、'timeout' 拖 8 秒、'writes' 只让写入（含删除）失败
+    down: {},
+    writes: [], // 每次写成功：{ table, kind: 'update'|'create'|'delete', records }
+    calls: [], // 每次调开放平台接口（含换 token、失败的）：{ at, method, path, full }
+    seq: 0,
+
+    // pageCap：查询每页最多回几行（真接口 500），账号表设得很小逼项目翻页
+    createTable(app, tableId, columns, pageCap = 500) {
+      const fields = columns.map(([name, type, options]) => ({ field_name: name, type, field_id: 'fld' + (++fs.seq), property: options ? { options: options.map((o) => ({ name: o })) } : null }));
+      fs.tables.set(tableId, { app, fields, rows: new Map(), pageCap });
+    },
+    addRow(tableId, cells) {
+      const id = 'rec' + randomBytes(5).toString('hex');
+      fs.tables.get(tableId).rows.set(id, { ...cells });
+      return id;
+    },
+    setCell(tableId, id, name, value) {
+      const row = fs.tables.get(tableId).rows.get(id);
+      if (value === undefined || value === null || value === '' || value === false) delete row[name];
+      else row[name] = value;
+    },
+    deleteRow(tableId, id) {
+      fs.tables.get(tableId).rows.delete(id);
+    },
+    removeField(tableId, name) {
+      const t = fs.tables.get(tableId);
+      t.fields = t.fields.filter((f) => f.field_name !== name);
+      for (const row of t.rows.values()) delete row[name];
+    },
+    addField(tableId, name, type) {
+      fs.tables.get(tableId).fields.push({ field_name: name, type, field_id: 'fld' + (++fs.seq), property: null });
+    },
+    row(tableId, id) {
+      return fs.tables.get(tableId).rows.get(id);
+    },
+    rows(tableId) {
+      return [...fs.tables.get(tableId).rows.entries()].map(([record_id, fields]) => ({ record_id, fields }));
+    },
+
+    async handle(method, u, authorization, raw, send) {
+      const ok = (data) => send(200, { code: 0, msg: 'success', data });
+      // full：不带筛选条件的整表查询（兜底对账）。
+      fs.calls.push({ at: Date.now(), method, path: u.pathname, full: u.pathname.endsWith('/records/search') && !safeJson(raw)?.filter });
+      if (method === 'POST' && u.pathname === '/open-apis/auth/v3/tenant_access_token/internal') {
+        const body = safeJson(raw);
+        if (body?.app_id !== fs.appId || body?.app_secret !== fs.appSecret) return send(200, { code: 10014, msg: 'app secret invalid' });
+        const token = 't-' + randomBytes(16).toString('hex');
+        fs.tokens.set(token, Date.now() + 7200_000);
+        return send(200, { code: 0, msg: 'ok', tenant_access_token: token, expire: 7200 });
+      }
+      const m = /^\/open-apis\/bitable\/v1\/apps\/([^/]+)\/tables\/([^/]+)\/(fields|records)(?:\/([^/]+))?$/.exec(u.pathname);
+      if (!m) return send(404, { code: 404, msg: 'not found' });
+      const [, app, tableId, kind, rest] = m;
+      const auth = /^Bearer (.+)$/.exec(authorization ?? '')?.[1];
+      if (!auth || !(fs.tokens.get(auth) > Date.now())) return send(400, { code: 99991663, msg: 'Invalid access token for authorization' });
+      const t = fs.tables.get(tableId);
+      if (!t || t.app !== app) return send(200, { code: 1254004, msg: 'WrongTableId' });
+      const isWrite = rest === 'batch_update' || rest === 'batch_create' || rest === 'batch_delete';
+      const mode = fs.down[tableId];
+      if (mode === 'timeout') await new Promise((r) => setTimeout(r, 8000));
+      if (mode === 'error' || mode === 'timeout' || (mode === 'writes' && isWrite)) return send(500, { code: 1255001, msg: 'InternalError' });
+      const byName = new Map(t.fields.map((f) => [f.field_name, f]));
+      const body = safeJson(raw) ?? {};
+
+      if (kind === 'fields' && method === 'GET') return ok({ items: t.fields.map((f) => ({ ...f })), has_more: false, page_token: '', total: t.fields.length });
+
+      if (method === 'POST' && rest === 'search') {
+        let items = [...t.rows.entries()];
+        for (const c of body.filter?.conditions ?? []) {
+          const f = byName.get(c.field_name);
+          if (!f) return send(200, { code: 1254045, msg: 'FieldNameNotFound' });
+          if (c.operator !== 'is') return send(200, { code: 1254018, msg: 'InvalidFilter' });
+          const want = String(c.value?.[0] ?? '');
+          items = items.filter(([, row]) => (f.type === FIELD_TYPES.text ? String(row[c.field_name] ?? '').toLowerCase() === want.toLowerCase() : row[c.field_name] === want));
+        }
+        for (const s of [...(body.sort ?? [])].reverse()) {
+          items.sort(([, a], [, b]) => ((a[s.field_name] ?? 0) < (b[s.field_name] ?? 0) ? -1 : (a[s.field_name] ?? 0) > (b[s.field_name] ?? 0) ? 1 : 0) * (s.desc ? -1 : 1));
+        }
+        const size = Math.min(Number(u.searchParams.get('page_size') || 20), 500, t.pageCap);
+        const start = Number(u.searchParams.get('page_token') || 0);
+        const page = items.slice(start, start + size);
+        const more = start + size < items.length;
+        return ok({ items: page.map(([id, row]) => ({ record_id: id, fields: searchCells(t, row) })), has_more: more, page_token: more ? String(start + size) : '', total: items.length });
+      }
+
+      if (method === 'POST' && rest === 'batch_delete') {
+        const ids = Array.isArray(body.records) ? body.records : [];
+        if (!ids.length || ids.length > 500) return send(200, { code: 1254001, msg: 'WrongRequestBody' });
+        for (const id of ids) t.rows.delete(id);
+        fs.writes.push({ table: tableId, kind: 'delete', records: ids });
+        return ok({ records: ids.map((id) => ({ deleted: true, record_id: id })) });
+      }
+
+      if (method === 'GET' && kind === 'records' && rest) {
+        const row = t.rows.get(rest);
+        if (!row) return send(200, { code: 1254043, msg: 'RecordIdNotFound' });
+        return ok({ record: { record_id: rest, fields: getCells(t, row) } });
+      }
+
+      if (method === 'POST' && isWrite) {
+        const records = Array.isArray(body.records) ? body.records : [];
+        if (!records.length || records.length > 500) return send(200, { code: 1254001, msg: 'WrongRequestBody' });
+        for (const r of records) {
+          if (rest === 'batch_update' && !t.rows.has(r.record_id)) return send(200, { code: 1254043, msg: 'RecordIdNotFound' });
+          for (const [name, value] of Object.entries(r.fields ?? {})) {
+            const f = byName.get(name);
+            if (!f) return send(200, { code: 1254045, msg: 'FieldNameNotFound' });
+            const okType =
+              f.type === FIELD_TYPES.datetime || f.type === FIELD_TYPES.number ? typeof value === 'number'
+              : f.type === FIELD_TYPES.checkbox ? typeof value === 'boolean'
+              : f.type === FIELD_TYPES.link ? Array.isArray(value) && value.every((v) => typeof v === 'string' && v.startsWith('rec'))
+              : typeof value === 'string';
+            if (!okType) return send(200, { code: 1254060, msg: `TextFieldConvFail ${name}` });
+          }
+        }
+        for (const r of records) {
+          if (rest === 'batch_update') for (const [name, value] of Object.entries(r.fields)) fs.setCell(tableId, r.record_id, name, value);
+          else fs.addRow(tableId, Object.fromEntries(Object.entries(r.fields).filter(([, v]) => v !== '' && v !== null)));
+        }
+        fs.writes.push({ table: tableId, kind: rest === 'batch_update' ? 'update' : 'create', records: structuredClone(records) });
+        return ok({ records });
+      }
+      return send(404, { code: 404, msg: 'not found' });
+    },
+  };
+  return fs;
+}
+
+// 查询接口的格子：文本是分段数组（4 个字以上拆成两段，逼项目拼起来），空格子不出现。
+function searchCells(t, row) {
+  const out = {};
+  for (const f of t.fields) {
+    const v = row[f.field_name];
+    if (v === undefined || v === '' || v === false) continue;
+    out[f.field_name] = f.type === FIELD_TYPES.text ? (v.length >= 4 ? [{ type: 'text', text: v.slice(0, 2) }, { type: 'text', text: v.slice(2) }] : [{ type: 'text', text: v }]) : v;
+  }
+  return out;
+}
+
+// 按 ID 取的格子：文本是纯字符串，空格子是 null。
+function getCells(t, row) {
+  const out = {};
+  for (const f of t.fields) {
+    const v = row[f.field_name];
+    out[f.field_name] = f.type === FIELD_TYPES.checkbox ? v === true : v === undefined || v === '' ? null : v;
+  }
+  return out;
+}
+
+function safeJson(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }

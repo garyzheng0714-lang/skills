@@ -6,7 +6,7 @@
 // 原生 http 自己传 next。
 
 import { createCipheriv, createDecipheriv, createHash, createHmac, createPublicKey, randomBytes, timingSafeEqual, verify } from 'node:crypto';
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import * as oidc from 'openid-client';
 
@@ -15,6 +15,8 @@ const CALLBACK_PATH = '/auth/feishu/fbif/callback';
 const LOGOUT_PATH = '/auth/feishu/logout';
 const ME_PATH = '/api/me';
 const BLOCKLIST_PATH = '/internal/auth/blocklist-changed';
+const ACCOUNTS_CHANGED_PATH = '/internal/auth/accounts-changed';
+const HEALTH_PATH = '/internal/auth/health';
 const ACCOUNT_PATH = '/auth/account/login';
 
 const SESSION_COOKIE = '__Host-fbif_sid';
@@ -24,6 +26,10 @@ const MINUTE = 60_000;
 const SESSION_IDLE_MS = 30 * 24 * 60 * MINUTE;
 const TOUCH_EVERY_MS = 60 * MINUTE;
 const DEFAULT_CHECK_MS = 5 * MINUTE;
+// 兜底对账：事件（账号表自动化、名单提醒）丢了也不会一直错下去。默认 6 小时一轮，最少 10 分钟、最多 24 小时。
+const DEFAULT_RECONCILE_MS = 6 * 60 * MINUTE;
+const MIN_RECONCILE_MS = 10 * MINUTE;
+const MAX_RECONCILE_MS = 24 * 60 * MINUTE;
 const OUTAGE_GRACE_MS = 15 * MINUTE;
 const TXN_TTL_MS = 10 * MINUTE;
 const OUTAGE_BACKOFF_MS = 30_000;
@@ -34,8 +40,28 @@ const UPSTREAM_TIMEOUT_MS = 20_000;
 // 账号密码：同一账号 15 分钟内连错 5 次就锁到这 15 分钟结束。
 const ACCOUNT_FAIL_LIMIT = 5;
 const ACCOUNT_LOCK_MS = 15 * MINUTE;
-// 账号快照最多用这么久就重拉；不超过核对周期，停用、重置密码最晚一个核对周期加这么久生效。
-const ACCOUNTS_MAX_AGE_MS = MINUTE;
+
+const DEFAULT_FEISHU_API = 'https://open.feishu.cn';
+const FEISHU_TIMEOUT_MS = 5_000;
+
+// 待写队列：有东西进来就写，写的时候新进来的攒着下一次一起写（一次最多 500 行）；失败才退避。
+// 日志超过 1 万条就丢最旧的（记 stderr）；积压超过 15 分钟或 1000 条，健康检查报警。
+const OUTBOX_MAX_LOGS = 10_000;
+const OUTBOX_BATCH = 500;
+const OUTBOX_MAX_BACKOFF_MS = 5 * MINUTE;
+const OUTBOX_STALE_MS = 15 * MINUTE;
+const OUTBOX_BACKLOG_LIMIT = 1000;
+// 一个进程最近一分钟最多新增这么多行请求日志，多的丢掉（防扫描器刷满日志表：飞书一张表最多两三万到五万行）。
+const REQUEST_ROWS_PER_MINUTE = 200;
+const DROPPED_WARN_MS = 15 * MINUTE;
+
+// 日志表留多少行（2026-10-16 用户同意请求日志「只留最新的」）：每写 500 行查一次总行数，
+// 超了就删最旧的「请求」行，删到上限的 90%；登录、退出、被收回的行永远不删。
+const DEFAULT_LOG_MAX_ROWS = 45_000;
+const LOG_TRIM_EVERY = 500;
+
+// 账号表变更提醒：同一行同时只处理一次，全局每分钟最多处理这么多次（伪造的提醒再多也只多读几次表）。
+const ACCOUNTS_CHANGED_PER_MINUTE = 60;
 
 /** 账号密码登录的人没有集成平台身份，company_code 记成这个，和 FBIF、富的分开。 */
 export const ACCOUNT_COMPANY_CODE = 'account';
@@ -46,7 +72,68 @@ const ALLOWED_COMPANY_CODES = new Set([
   'FMZYRL01RNE', // 富的
 ]);
 
-/** 集成平台给的身份。认人用 identityKey()，不要用邮箱：富的账号邮箱为空。 */
+// 账号表的列（2026-10-16 用户裁定）。人填账号、密码、备注、账号状态和各功能的复选框；
+// 系统只写状态、状态说明、最近登录三列，人填的列一个字都不碰。
+const COL_USERNAME = '账号';
+const COL_PASSWORD = '密码';
+const COL_ENABLED = '账号状态';
+const COL_STATUS = '状态';
+const COL_NOTE = '状态说明';
+const COL_LAST_LOGIN = '最近登录';
+
+const ENABLED_VALUE = '启用';
+const DISABLED_VALUE = '禁用';
+
+const STATUS_OK = '正常';
+const STATUS_DISABLED = '已禁用';
+const STATUS_LOCKED = '已锁定';
+const STATUS_MISCONFIGURED = '配置有误';
+
+const METHOD_FEISHU = '飞书';
+const METHOD_ACCOUNT = '账号密码';
+
+const EVENT_LOGIN_OK = '登录成功';
+const EVENT_LOGIN_FAIL = '登录失败';
+const EVENT_LOGOUT = '退出';
+const EVENT_REVOKED = '被收回';
+const EVENT_REQUEST = '请求';
+
+// 日志「类型」「结果」两列的值。
+const TYPE_LOGIN = '登录';
+const TYPE_LOGOUT = '退出';
+const TYPE_REVOKED = '被收回';
+const TYPE_REQUEST = '请求';
+const RESULT_OK = '成功';
+const RESULT_FAIL = '失败';
+
+type Target = 'log' | 'accounts';
+
+// 多维表格字段类型。
+const FIELD_TEXT = 1;
+const FIELD_NUMBER = 2;
+const FIELD_SELECT = 3;
+const FIELD_DATETIME = 5;
+const FIELD_CHECKBOX = 7;
+const FIELD_LINK = 18; // 单向关联；双向关联（21）也认
+const FIELD_DUPLEX = 21;
+
+type Column = [name: string, type: number];
+
+const ACCOUNT_COLUMNS: Column[] = [
+  [COL_USERNAME, FIELD_TEXT], [COL_PASSWORD, FIELD_TEXT], [COL_ENABLED, FIELD_SELECT],
+  [COL_STATUS, FIELD_SELECT], [COL_NOTE, FIELD_TEXT], [COL_LAST_LOGIN, FIELD_DATETIME],
+];
+
+// 日志表所有项目共用一张，「项目」关联到总账本「系统」表里本项目那一行。
+const LOG_COLUMNS: Column[] = [
+  ['摘要', FIELD_TEXT], ['时间', FIELD_DATETIME], ['项目', FIELD_LINK], ['类型', FIELD_SELECT], ['结果', FIELD_SELECT],
+  ['原因', FIELD_TEXT], ['登录方式', FIELD_SELECT], ['公司', FIELD_TEXT], ['用户标识', FIELD_TEXT], ['姓名', FIELD_TEXT],
+  ['邮箱', FIELD_TEXT], ['账号', FIELD_TEXT], ['记录ID', FIELD_TEXT], ['权限', FIELD_TEXT], ['方法', FIELD_SELECT],
+  ['路径', FIELD_TEXT], ['状态码', FIELD_NUMBER], ['耗时毫秒', FIELD_NUMBER], ['次数', FIELD_NUMBER], ['IP', FIELD_TEXT],
+  ['IP来源', FIELD_TEXT], ['浏览器', FIELD_TEXT], ['登录后去哪', FIELD_TEXT], ['会话', FIELD_TEXT],
+];
+
+/** 集成平台给的身份。认人用 identityKey()，不要用邮箱：富的账号邮箱为空。账号密码登录的人 sub 是账号表那一行的 record_id，name 是账号。 */
 export interface Identity {
   company_code: string;
   sub: string;
@@ -56,8 +143,19 @@ export interface Identity {
 }
 export const identityKey = (id: Identity) => `${id.company_code}:${id.sub}`;
 
+/** 已登录请求里的当前用户（req.ssoUser）。features 是这个人能用的功能（Feature.key） */
 export interface User extends Identity {
   id: string;
+  features: string[];
+}
+
+/**
+ * 项目里按人开关的功能，在代码里声明。column 是账号表里对应复选框列的列名，一字不差。
+ * 飞书登录的人有全部功能；账号密码登录的人只有那一行勾上的。列不存在或不是复选框，这个功能对所有人关掉。
+ */
+export interface Feature {
+  key: string;
+  column: string;
 }
 
 export interface Session {
@@ -71,8 +169,10 @@ export interface Session {
   version: number;
   /** true 是账号密码登录的会话：没有 refresh_token，不找集成平台核对，也不归停用名单管 */
   account?: boolean;
-  /** 登录时的密码指纹（Account.credential），管理员重置密码后对不上，会话就下线 */
+  /** 登录时密码的指纹（不是密码本身），表里改了密码对不上，会话就下线 */
   accountCredential?: string;
+  /** 账号会话那一行勾上的功能，每个核对周期按表更新；飞书会话不用它 */
+  features?: string[];
 }
 
 export interface BlockEntry {
@@ -88,8 +188,6 @@ export interface Blocklist {
 export class ConflictError extends Error {}
 export class StaleBlocklistError extends Error {}
 export class NotAllowedError extends Error {}
-/** 账号或密码错（不区分是哪个） */
-export class AuthFailedError extends Error {}
 
 /** 会话和停用名单的存储。多实例部署必须用所有实例共享的库实现，踢人和拒绝登录才能所有实例一起生效。 */
 export interface Store {
@@ -102,6 +200,8 @@ export interface Store {
   deleteSession(idHash: string): Promise<Session | null>;
   /** 删掉这些 sub 的全部会话并返回它们；账号密码会话（account=true）不归名单管，不删 */
   deleteSessionsBySub(subs: Record<string, BlockEntry>): Promise<Session[]>;
+  /** 全部账号密码会话（account=true；sub 是账号表那一行的 record_id），对账号表用 */
+  accountSessions(): Promise<Session[]>;
   /** 库里名单的版本；synced=false 表示从没成功同步过 */
   blocklistRevision(): Promise<{ revision: number; synced: boolean }>;
   /** 查一个 sub 在不在名单里，不在返回 null */
@@ -112,32 +212,10 @@ export interface Store {
 
 export interface Options {
   store: Store;
-  /** 把身份对上本项目的用户（按 identityKey 查找或新建），返回本项目用户 ID；抛 NotAllowedError 表示本项目不让这个人进 */
+  /** 把身份对上本项目的用户（按 identityKey 查找或新建），返回本项目用户 ID；抛 NotAllowedError 表示本项目不让这个人进。账号密码登录同样经过它，company_code 是 'account' */
   onLogin(id: Identity): Promise<string>;
-  /**
-   * 外部供应商、兼职这类没有飞书的人的账号密码，可选。不填就用 SSO_ACCOUNTS_URL（集成平台工作流，见 remoteAccounts）；
-   * 那也没配就是没有账号，账号密码登录一律回「账号或密码错误」。账号登录同样经过 onLogin，company_code 是 'account'。
-   */
-  accounts?: Accounts;
-}
-
-/** 账号密码的来源。项目已有供应商账号表就自己实现，否则用集成平台工作流（SSO_ACCOUNTS_URL）。username 进来前已去空格、转小写 */
-export interface Accounts {
-  /** 账号存在、能用、密码对才返回账号；其余一律抛 AuthFailedError。别的错误（比如读不到账号表）让这次登录回 503 */
-  verify(username: string, password: string): Promise<Account>;
-  /**
-   * 账号还在、能用、密码指纹仍是 credential（登录时 verify 给的）返回 true。
-   * 登着的账号会话每个核对周期查一次，false 就踢下线：停用、到期、重置密码都靠它
-   */
-  active(username: string, credential: string): Promise<boolean>;
-}
-
-/** 账号密码登录的人。username 统一小写，就是 Identity.sub */
-export interface Account {
-  username: string;
-  name: string;
-  /** 密码的指纹，重置密码后必须变；不能是密码或哈希本身（它会存进会话） */
-  credential: string;
+  /** 本项目按人开关的功能，可选；接口里用 hasFeature(req, key) 判断 */
+  features?: Feature[];
 }
 
 type Req = IncomingMessage & { ssoUser?: User; body?: unknown };
@@ -146,12 +224,35 @@ type Next = (err?: unknown) => void;
 type Handler = (req: Req, res: Res, next: Next) => void;
 
 export interface Sso {
-  /** 飞书登录、回调、账号密码登录、退出、/api/me、名单提醒六条路由；别的请求交给 next。挂在 body 解析中间件之前 */
+  /** 飞书登录、回调、账号密码登录、退出、/api/me、名单提醒、账号表变更提醒、健康检查八条路由；别的请求交给 next。挂在 body 解析中间件之前 */
   routes: Handler;
+  /**
+   * 记请求日志，放在所有路由前面（app.use(sso.logRequests)）。只记 401、403、5xx、改数据的请求（POST/PUT/PATCH/DELETE，任何状态）、
+   * 敏感接口（requireFreshUser）、调了 audit(req) 的接口；普通的成功 GET 和 404 不记。只记方法、不带查询串的路径、状态码、耗时、
+   * 谁（有会话时）、IP、浏览器；请求体、查询串、cookie 和别的请求头一概不记。响应发完才记，不拖慢请求。
+   */
+  logRequests: Handler;
   /** 包住所有要登录的接口，包括下载、导出、长连接。没登录回 401 */
   requireUser: Handler;
   /** 给 HR、盖章、改权限、敏感导出：每次当场找集成平台核对，核对不了就拒绝；账号密码会话一律 403 */
   requireFreshUser: Handler;
+}
+
+/** 当前用户能不能用某个功能（Options.features 里的 key），只在 requireUser 包住的接口里有意义 */
+export const hasFeature = (req: IncomingMessage, key: string) => ((req as Req).ssoUser?.features ?? []).includes(key);
+
+/** logRequests 给每个请求开的小本子，requireUser、audit 往里记 */
+interface RequestNote {
+  sess?: Session;
+  fresh?: boolean;
+  audit?: boolean;
+}
+const notes = new WeakMap<IncomingMessage, RequestNote>();
+
+/** 让这个请求一定记进日志：导出、下载这类要留痕的接口在处理函数里调一下。要挂了 logRequests 才起作用 */
+export function audit(req: IncomingMessage) {
+  const n = notes.get(req);
+  if (n) n.audit = true;
 }
 
 const REJECTED = Symbol('rejected');
@@ -161,11 +262,43 @@ class DeniedError extends Error {}
 class TokenStaleError extends Error {}
 class RejectedError extends Error {}
 
+/** 登录日志的一行。密码、令牌、授权码、state、cookie 一律不进来 */
+interface LoginEvent {
+  event?: string;
+  reason?: string;
+  method?: string;
+  company?: string;
+  subject?: string;
+  name?: string;
+  email?: string;
+  account?: string;
+  recordId?: string;
+  permissions?: string;
+  ip?: string;
+  ipSource?: string;
+  browser?: string;
+  next?: string;
+  session?: string;
+  /** 只有「请求」行有：HTTP 方法、不带查询串的路径、状态码、耗时 */
+  verb?: string;
+  path?: string;
+  status?: number;
+  durationMs?: number;
+  /** 还没写出去的一样的请求（方法、路径、状态码、人，没登录按 IP）合成一行 */
+  mergeKey?: string;
+}
+
 /**
  * 读环境变量：SSO_ISSUER、SSO_CLIENT_ID、SSO_CLIENT_SECRET、SSO_REDIRECT_URL、SSO_BLOCKLIST_URL、SSO_TOKEN_KEY；
- * 可选 SSO_ACCOUNTS_URL（账号密码，见 remoteAccounts）；SSO_CHECK_INTERVAL、SSO_SYNC_MIN_GAP（如 2s）只给合规测试用，生产留空。
+ * 可选 SSO_ACCOUNTS_TABLE、SSO_LOG_TABLE（多维表格链接）及配了表就必填的 SSO_FEISHU_APP_ID、SSO_FEISHU_APP_SECRET、SSO_OUTBOX_FILE，
+ * 配了日志表就必填的 SSO_LOG_PROJECT_RECORD，可选 SSO_LOG_MAX_ROWS（默认 45000）、SSO_RECONCILE_INTERVAL（兜底对账间隔，默认 6h，10m～24h）；
+ * SSO_FEISHU_API、SSO_CHECK_INTERVAL、SSO_SYNC_MIN_GAP（如 2s）只给合规测试用，生产留空。
+ * 事件优先：账号表靠登录、用户的请求和账号表变更提醒，名单靠名单提醒，日志有东西进来就写；
+ * 进程里另有一个兜底对账循环（reconcileLoop），启动先跑一轮，之后每 SSO_RECONCILE_INTERVAL 一轮。
  */
 export async function createSso(opts: Options): Promise<Sso> {
+  const features = opts.features ?? [];
+  validateFeatures(features);
   const names = ['SSO_ISSUER', 'SSO_CLIENT_ID', 'SSO_CLIENT_SECRET', 'SSO_REDIRECT_URL', 'SSO_BLOCKLIST_URL', 'SSO_TOKEN_KEY'] as const;
   const env = Object.fromEntries(names.map((k) => [k, (process.env[k] ?? '').trim()])) as Record<(typeof names)[number], string>;
   const missing = names.filter((k) => !env[k]);
@@ -174,9 +307,33 @@ export async function createSso(opts: Options): Promise<Sso> {
   if (redirect.pathname !== CALLBACK_PATH) throw new Error(`sso: SSO_REDIRECT_URL must end with ${CALLBACK_PATH}`);
   const key = Buffer.from(env.SSO_TOKEN_KEY, 'base64');
   if (key.length !== 32) throw new Error('sso: SSO_TOKEN_KEY must be 32 random bytes in base64 (openssl rand -base64 32)');
-  const checkEveryMs = process.env.SSO_CHECK_INTERVAL ? parseDuration(process.env.SSO_CHECK_INTERVAL) : DEFAULT_CHECK_MS;
+  const checkEveryMs = envDuration('SSO_CHECK_INTERVAL', DEFAULT_CHECK_MS);
+  const reconcileEveryMs = envDuration('SSO_RECONCILE_INTERVAL', DEFAULT_RECONCILE_MS);
+  // 每轮整表读一次账号表、拉一次名单（集成平台按运行次数计费）。短于 10 分钟只给合规测试（连的是假飞书）用。
+  if (reconcileEveryMs < MIN_RECONCILE_MS && !(process.env.SSO_FEISHU_API ?? '').trim()) throw new Error(`sso: SSO_RECONCILE_INTERVAL ${process.env.SSO_RECONCILE_INTERVAL} is too short, at least 10m`);
+  if (reconcileEveryMs > MAX_RECONCILE_MS) throw new Error(`sso: SSO_RECONCILE_INTERVAL ${process.env.SSO_RECONCILE_INTERVAL} is too long, at most 24h`);
   // 每次拉名单都算集成平台一次工作流运行（按月计费）：伪造的提醒再多，一个实例每 30 秒最多拉一次。
-  const syncGapMs = process.env.SSO_SYNC_MIN_GAP ? parseDuration(process.env.SSO_SYNC_MIN_GAP) : DEFAULT_SYNC_GAP_MS;
+  const syncGapMs = envDuration('SSO_SYNC_MIN_GAP', DEFAULT_SYNC_GAP_MS);
+  const accountsTable = envTable('SSO_ACCOUNTS_TABLE');
+  const logTable = envTable('SSO_LOG_TABLE');
+  const projectRec = (process.env.SSO_LOG_PROJECT_RECORD ?? '').trim();
+  if (logTable && !RECORD_ID.test(projectRec)) throw new Error('sso: SSO_LOG_TABLE set but SSO_LOG_PROJECT_RECORD missing or not a record id (rec…): the row id of this project in the 总账本「系统」table');
+  let logMaxRows = DEFAULT_LOG_MAX_ROWS;
+  const maxRaw = (process.env.SSO_LOG_MAX_ROWS ?? '').trim();
+  if (maxRaw) {
+    logMaxRows = Number(maxRaw);
+    if (!Number.isInteger(logMaxRows) || logMaxRows < 100) throw new Error(`sso: bad SSO_LOG_MAX_ROWS ${maxRaw} (a row count, at least 100)`);
+  }
+  let feishu: Bitable | null = null;
+  let outbox: Outbox | null = null;
+  if (accountsTable || logTable) {
+    const extra = ['SSO_FEISHU_APP_ID', 'SSO_FEISHU_APP_SECRET', 'SSO_OUTBOX_FILE'].map((k) => [k, (process.env[k] ?? '').trim()]);
+    const lacking = extra.filter(([, v]) => !v).map(([k]) => k);
+    if (lacking.length) throw new Error(`sso: SSO_ACCOUNTS_TABLE/SSO_LOG_TABLE set but missing env ${lacking.join(', ')}`);
+    const [appId, appSecret, outboxPath] = extra.map(([, v]) => v);
+    feishu = new Bitable((process.env.SSO_FEISHU_API ?? '').trim().replace(/\/+$/, '') || DEFAULT_FEISHU_API, appId, appSecret);
+    outbox = new Outbox(outboxPath, [...(accountsTable ? ['accounts' as const] : []), ...(logTable ? ['log' as const] : [])]);
+  }
 
   const issuer = new URL(env.SSO_ISSUER);
   const config = await oidc.discovery(
@@ -194,8 +351,8 @@ export async function createSso(opts: Options): Promise<Sso> {
   const basicAuth = 'Basic ' + Buffer.from(`${encodeURIComponent(env.SSO_CLIENT_ID)}:${encodeURIComponent(env.SSO_CLIENT_SECRET)}`).toString('base64');
   const userInfoUrl = meta.userinfo_endpoint;
   const { store } = opts;
-  const accountsUrl = (process.env.SSO_ACCOUNTS_URL ?? '').trim();
-  const accounts: Accounts | null = opts.accounts ?? (accountsUrl ? remoteAccounts(accountsUrl, redirect.origin, Math.min(ACCOUNTS_MAX_AGE_MS, checkEveryMs)) : null);
+  const credKey = createHmac('sha256', key).update('sso-account-credential').digest();
+  const compareKey = randomBytes(32);
 
   const seal = (purpose: string, plain: string) => {
     const nonce = randomBytes(12);
@@ -279,11 +436,78 @@ export async function createSso(opts: Options): Promise<Sso> {
     }
   };
 
+  // ---------- 健康状况与功能开关 ----------
+
+  const issues: Record<Target, Map<string, string>> = { accounts: new Map(), log: new Map() };
+  /** 最近一次读账号表失败了（健康检查据此报 accounts_unreachable）；删了的行不算失败 */
+  let accountsFailed = false;
+  const accountsRead = (err: unknown) => (accountsFailed = !!err && !(err instanceof RecordNotFoundError));
+
+  // 换上新的表结构问题，出现和消失各记一行 stderr。
+  const setIssues = (table: Target, next: Map<string, string>) => {
+    const prev = issues[table];
+    issues[table] = next;
+    for (const [code, detail] of next) if (!prev.has(code)) console.error(`sso: table problem ${code}: ${detail}`);
+    for (const code of prev.keys()) if (!next.has(code)) console.error(`sso: table problem cleared: ${code}`);
+  };
+
+  const brokenFeatures = () => new Set([...issues.accounts.keys()].filter((c) => c.startsWith('feature_column:')).map((c) => c.slice('feature_column:'.length)));
+  /** 此刻没被表结构问题关掉的全部功能（飞书登录的人就是这些） */
+  const allFeatures = () => {
+    const broken = brokenFeatures();
+    return features.filter((f) => !broken.has(f.key)).map((f) => f.key);
+  };
+  const featuresOf = (sess: Session) => (sess.account ? allFeatures().filter((k) => (sess.features ?? []).includes(k)) : allFeatures());
+  const checkedFeatures = (row: AccountRow) => features.filter((f) => row.checked.has(f.column)).map((f) => f.key);
+  const permissionColumns = (keys: string[]) => features.filter((f) => keys.includes(f.key)).map((f) => f.column).join('、');
+
+  // ---------- 登录日志 ----------
+
+  /** 把一条日志排进待写队列；没配日志表就只留 stderr。登录和请求从不等它 */
+  const record = (e: LoginEvent) => {
+    if (!logTable || !outbox) return;
+    const [type, result] = typeAndResult(e);
+    const f: Record<string, unknown> = { 摘要: clip(summary(e), 200), 时间: Date.now(), 项目: [projectRec], 类型: type, 次数: 1 };
+    if (result) f.结果 = result;
+    if (e.status) {
+      f.状态码 = e.status;
+      f.耗时毫秒 = e.durationMs ?? 0;
+    }
+    const put: [string, string | undefined, number][] = [
+      ['原因', e.reason, 200], ['登录方式', e.method, 20], ['公司', e.company, 50],
+      ['用户标识', e.subject, 100], ['姓名', e.name, 100], ['邮箱', e.email, 200], ['账号', e.account, 100],
+      ['记录ID', e.recordId, 100], ['权限', e.permissions, 500], ['方法', e.verb, 10], ['路径', e.path, 500],
+      ['IP', e.ip, 100], ['IP来源', e.ipSource, 50], ['浏览器', e.browser, 500], ['登录后去哪', e.next, 500], ['会话', e.session, 12],
+    ];
+    for (const [col, val, max] of put) if (val) f[col] = clip(val, max);
+    outbox.add({ target: 'log', fields: f, merge: e.mergeKey });
+  };
+
+  const sessionEvent = (ev: LoginEvent, sess: Session, event: string, reason = ''): LoginEvent => ({
+    ...withIdentity(ev, sess.identity),
+    event,
+    reason,
+    session: sessionTag(sess.idHash),
+    method: sess.account ? METHOD_ACCOUNT : METHOD_FEISHU,
+    recordId: sess.account ? sess.identity.sub : undefined,
+    account: sess.account ? sess.identity.name : ev.account,
+    permissions: permissionColumns(featuresOf(sess)),
+  });
+
+  const recordRevoked = (req: Req | null, sess: Session, reason: string) => record(sessionEvent(req ? requestEvent(req, '') : {}, sess, EVENT_REVOKED, reason));
+
   // shortcut: 撤销失败只记日志不重试（令牌只在服务端，会话已删）；要做到必撤，就把加密的令牌连同删除一起写进待撤销表。
   const endSession = async (idHash: string) => {
     const s = await store.deleteSession(idHash);
     retryAfter.delete(idHash);
     if (s && !s.account) await revoke(open('refresh-token', s.refreshSeal) ?? undefined);
+    return s;
+  };
+
+  /** 下线并记一条「被收回」；会话已经不在（别的请求先踢了）就不记 */
+  const revokeSession = async (req: Req | null, idHash: string, reason: string) => {
+    const gone = await endSession(idHash).catch(() => null);
+    if (gone) recordRevoked(req, gone, reason);
   };
 
   const retryAfter = new Map<string, number>();
@@ -318,21 +542,24 @@ export async function createSso(opts: Options): Promise<Sso> {
 
   const handleCallback = async (req: Req, res: Res) => {
     const q = new URL(req.url ?? '/', 'http://x').searchParams;
-    const fail = (code: string, why: string) => {
+    let ev = requestEvent(req, METHOD_FEISHU);
+    const fail = (code: string, reason: string, why: string) => {
       console.log(`sso: login failed (${code}): ${why}`);
+      record({ ...ev, event: EVENT_LOGIN_FAIL, reason });
       redirectTo(res, `/login?error=${code}`);
     };
     const state = q.get('state') ?? '';
-    if (state.length < 16) return fail('expired', 'no state');
+    if (state.length < 16) return fail('expired', '回调没带 state', 'no state');
     const cookie = readCookies(req)[txnCookieName(state)];
     setCookie(res, txnCookieName(state), '', -1);
-    if (q.get('error')) return fail('denied', `idp error ${q.get('error')}`);
-    if (!cookie) return fail('expired', 'no login txn cookie');
+    if (q.get('error')) return fail('denied', '集成平台返回错误：' + cleanCode(q.get('error')!), `idp error ${cleanCode(q.get('error')!)}`);
+    if (!cookie) return fail('expired', '登录事务不在这个浏览器里', 'no login txn cookie');
     const raw = open('login-txn', cookie);
     const txn = raw ? (JSON.parse(raw) as { state: string; nonce: string; verifier: string; next: string; expires: number }) : null;
-    if (!txn || txn.state !== state || Date.now() > txn.expires) return fail('expired', 'login txn invalid');
+    if (!txn || txn.state !== state || Date.now() > txn.expires) return fail('expired', '登录事务对不上或已过期', 'login txn invalid');
+    ev.next = txn.next;
     // shortcut: 只防同一实例内的并发回调；多实例要防，就把登录事务放进共享库原子消费。
-    if (!consumeState(state, txn.expires)) return fail('expired', 'login txn already used');
+    if (!consumeState(state, txn.expires)) return fail('expired', '登录事务已用过', 'login txn already used');
 
     let tokens: Awaited<ReturnType<typeof oidc.authorizationCodeGrant>>;
     try {
@@ -340,38 +567,46 @@ export async function createSso(opts: Options): Promise<Sso> {
       current.search = q.toString();
       // 授权码只换一次，失败也不重试：集成平台见到重放会把第一次发的令牌一并作废。
       tokens = await oidc.authorizationCodeGrant(config, current, { pkceCodeVerifier: txn.verifier, expectedState: txn.state, expectedNonce: txn.nonce, idTokenExpected: true });
-      await verifyIdTokenSignature(tokens.id_token ?? '').catch(async (e) => {
-        await revoke(tokens.refresh_token);
-        throw e;
-      });
     } catch (e) {
-      return fail('failed', `exchange or id_token: ${describe(e)}`);
+      // openid-client 在这一步一起校验 id_token 的 iss、aud、exp、nonce：令牌端点回了 200 才算换到了令牌。
+      const exchanged = e instanceof oidc.ResponseBodyError || (e instanceof Error && /token endpoint|HTTP/i.test(e.message) && !/id_token|claim|nonce|iss|aud|exp/i.test(e.message));
+      return fail('failed', exchanged ? '换令牌失败' : 'ID 令牌无效', `exchange or id_token: ${describe(e)}`);
+    }
+    try {
+      await verifyIdTokenSignature(tokens.id_token ?? '');
+    } catch (e) {
+      await revoke(tokens.refresh_token);
+      return fail('failed', 'ID 令牌无效', `id_token: ${describe(e)}`);
     }
     const claims = tokens.claims() as unknown as Partial<Identity> | undefined;
+    // 下面几种失败把 claims 一并记进日志，能看出是谁被拒。
+    ev = withIdentity(ev, { company_code: claims?.company_code ?? '', sub: claims?.sub ?? '', name: claims?.name ?? '', email: claims?.email });
     let identity: Identity;
     try {
-      if (!claims?.sub) throw Object.assign(new Error('id_token without sub'), { code: 'failed' });
-      if (!ALLOWED_COMPANY_CODES.has(claims.company_code ?? '')) throw Object.assign(new Error(`company_code ${claims.company_code} not allowed`), { code: 'unauthorized_tenant' });
-      if (!tokens.refresh_token) throw Object.assign(new Error('no refresh_token (offline_access not granted)'), { code: 'failed' });
+      if (!claims?.sub) throw Object.assign(new Error('id_token without sub'), { code: 'failed', reason: 'ID 令牌没有 sub' });
+      if (!ALLOWED_COMPANY_CODES.has(claims.company_code ?? '')) throw Object.assign(new Error(`company_code ${claims.company_code} not allowed`), { code: 'unauthorized_tenant', reason: '不是 FBIF 或富的：' + cleanCode(claims.company_code ?? '') });
+      if (!tokens.refresh_token) throw Object.assign(new Error('no refresh_token (offline_access not granted)'), { code: 'failed', reason: '没拿到 refresh_token' });
       const info = await userInfo(tokens.access_token, claims.sub).catch((e) => {
-        throw Object.assign(e, { code: e instanceof DeniedError ? 'denied' : 'failed' });
+        throw Object.assign(e, e instanceof DeniedError ? { code: 'denied', reason: '集成平台禁止访问' } : { code: 'failed', reason: '查用户信息失败' });
       });
       identity = { company_code: claims.company_code!, sub: claims.sub, name: claims.name || info.name || '', email: claims.email || info.email || '', picture: claims.picture || info.picture || '' };
     } catch (e) {
       await revoke(tokens.refresh_token);
-      return fail((e as { code?: string }).code ?? 'failed', describe(e));
+      const { code, reason } = e as { code?: string; reason?: string };
+      return fail(code ?? 'failed', reason ?? '查用户信息失败', describe(e));
     }
+    ev = { ...withIdentity(ev, identity), permissions: permissionColumns(allFeatures()) };
     const why = await blocked(identity.sub);
     if (why) {
       await revoke(tokens.refresh_token);
-      return fail('disabled', `sub ${identity.sub} refused: ${why}`);
+      return fail('disabled', '停用名单：' + why, `sub ${identity.sub} refused: ${why}`);
     }
     let userId: string;
     try {
       userId = await opts.onLogin(identity);
     } catch (e) {
       await revoke(tokens.refresh_token);
-      return e instanceof NotAllowedError ? fail('unauthorized_tenant', `project refused ${identityKey(identity)}`) : fail('failed', `onLogin: ${describe(e)}`);
+      return e instanceof NotAllowedError ? fail('unauthorized_tenant', '本项目不让进', `project refused ${identityKey(identity)}`) : fail('failed', 'onLogin 出错', `onLogin: ${describe(e)}`);
     }
 
     const sid = randomBytes(32).toString('base64url');
@@ -381,15 +616,18 @@ export async function createSso(opts: Options): Promise<Sso> {
       await store.createSession(session);
     } catch (e) {
       await revoke(tokens.refresh_token);
-      return fail('failed', `create session: ${describe(e)}`);
+      return fail('failed', '建会话失败', `create session: ${describe(e)}`);
     }
+    ev.session = sessionTag(session.idHash);
     // 名单同步先落名单再扫会话；这里先建会话再查一次名单，两边交错时不会漏掉人。
-    if (await blocked(identity.sub)) {
+    const late = await blocked(identity.sub);
+    if (late) {
       await endSession(session.idHash);
-      return fail('disabled', `sub ${identity.sub} blocked during login`);
+      return fail('disabled', '停用名单：' + late, `sub ${identity.sub} blocked during login`);
     }
     setCookie(res, SESSION_COOKIE, sid, SESSION_IDLE_MS + TOUCH_EVERY_MS);
     console.log(`sso: login ${identityKey(identity)} user=${userId}`);
+    record({ ...ev, event: EVENT_LOGIN_OK });
     redirectTo(res, txn.next || '/');
   };
 
@@ -401,15 +639,65 @@ export async function createSso(opts: Options): Promise<Sso> {
     const f = fails.get(name);
     return !f || f.n < ACCOUNT_FAIL_LIMIT || Date.now() - f.first > ACCOUNT_LOCK_MS;
   };
-  const recordFailure = (name: string) => {
+  /** 记一次失败；这一次正好凑满 5 次时返回解锁时间 */
+  const recordFailure = (name: string): number | null => {
     if (fails.size > 10_000) for (const [k, f] of fails) if (Date.now() - f.first > ACCOUNT_LOCK_MS) fails.delete(k);
     let f = fails.get(name);
     if (!f || Date.now() - f.first > ACCOUNT_LOCK_MS) fails.set(name, (f = { n: 0, first: Date.now() }));
     f.n++;
+    return f.n === ACCOUNT_FAIL_LIMIT ? f.first + ACCOUNT_LOCK_MS : null;
+  };
+  /** 此刻锁着的账号 → 解锁时间 */
+  const lockedNames = () => {
+    const out = new Map<string, number>();
+    for (const [k, f] of fails) if (f.n >= ACCOUNT_FAIL_LIMIT && Date.now() - f.first <= ACCOUNT_LOCK_MS) out.set(k, f.first + ACCOUNT_LOCK_MS);
+    return out;
   };
 
-  // 给没有飞书的外部供应商、兼职：POST JSON {username, password}。
-  // 成功 200 并下发同一个会话 cookie；账号或密码错 401 auth_failed；连错太多 429 rate_limited。
+  /** 两边都用本进程的随机密钥做 HMAC 再定长比较，比较耗时和密码长短、对错都无关 */
+  const samePassword = (a: string, b: string) => timingSafeEqual(createHmac('sha256', compareKey).update(a).digest(), createHmac('sha256', compareKey).update(b).digest());
+  /** 存进会话的密码指纹：表里改了密码指纹就变，会话里又不存密码本身 */
+  const credential = (password: string) => createHmac('sha256', credKey).update(password.trim()).digest('hex').slice(0, 16);
+
+  /** 判这次账号登录：返回对上的那一行，不让进时返回原因（只写日志，不回给浏览器） */
+  const loginVerdict = (rows: AccountRow[], password: string): [AccountRow | null, string] => {
+    if (rows.length === 0) return [null, '账号不存在'];
+    if (rows.length > 1) return [null, '账号重复'];
+    const row = rows[0];
+    const stored = row.password.trim();
+    if (!stored) return [row, '配置有误：缺密码'];
+    if (!samePassword(stored, password)) return [row, '密码不对'];
+    if (row.enabled !== ENABLED_VALUE) return [row, enabledRefusal(row.enabled)];
+    return [row, ''];
+  };
+
+  /** 登着的账号会话要下线的原因，空串是不用下线 */
+  const revokeReason = (row: AccountRow, cred: string) => {
+    if (row.enabled !== ENABLED_VALUE) return '账号已停用';
+    if (credential(row.password) !== cred) return '密码已改';
+    return '';
+  };
+
+  /** 按账号当场查表。表里的「是」不分大小写，查回来再按去空格、转小写后完全相等过一遍 */
+  const findAccount = async (name: string) => {
+    const filter = { conjunction: 'and', conditions: [{ field_name: COL_USERNAME, operator: 'is', value: [name] }] };
+    let recs: BitableRecord[];
+    try {
+      recs = await feishu!.search(accountsTable!, filter, null, 10);
+    } catch (e) {
+      accountsRead(e);
+      throw e;
+    }
+    accountsRead(null);
+    return recs.map(parseAccountRow).filter((row) => normalizeUsername(row.username) === name);
+  };
+
+  /** 把状态类的三列排进待写队列；只会是 状态、状态说明、最近登录 */
+  const writeBack = (recordId: string, fields: Record<string, unknown>) => outbox!.add({ target: 'accounts', recordId, fields });
+
+  // 给没有飞书的外部供应商、兼职：POST JSON {username, password}，当场查一次账号表。
+  // 成功 200 并下发同一个会话 cookie；不让进一律 401 auth_failed（真实原因只写日志）；连错太多 429 rate_limited；
+  // 账号表查不了 503 login_service_unavailable（不放人，也不算连错）。
   const handleAccountLogin = async (req: Req, res: Res) => {
     // 只收 JSON：跨站页面不经预检发不出这个类型，别人没法悄悄把你登进他的账号。
     if ((req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase() !== 'application/json') return sendJson(res, 415, { error: 'json_required' });
@@ -417,75 +705,358 @@ export async function createSso(opts: Options): Promise<Sso> {
     try {
       input = (req.body !== undefined ? req.body : JSON.parse(await readBody(req, 4096))) ?? {};
     } catch {}
-    const name = (typeof input.username === 'string' ? input.username : '').trim().toLowerCase();
-    // 密码是系统生成的，不含空白；转发时常多带一个空格或换行。
+    const typed = typeof input.username === 'string' ? input.username : '';
+    const name = normalizeUsername(typed);
+    // 密码前后不会有空白；转发时常多带一个空格或换行。
     const password = typeof input.password === 'string' ? input.password.trim() : '';
-    if (!allowAttempt(name)) return sendJson(res, 429, { error: 'rate_limited' });
-    let acct: Account;
-    try {
-      if (!accounts || !name || !password) throw new AuthFailedError();
-      acct = await accounts.verify(name, password);
-    } catch (e) {
-      if (!(e instanceof AuthFailedError)) {
-        console.log(`sso: account login ${JSON.stringify(name)}: ${describe(e)}`);
-        return sendJson(res, 503, { error: 'login_service_unavailable' });
-      }
-      recordFailure(name);
-      console.log(`sso: account login ${JSON.stringify(name)} refused`);
-      return sendJson(res, 401, { error: 'auth_failed' });
+    let ev: LoginEvent = { ...requestEvent(req, METHOD_ACCOUNT), account: clip(typed.trim(), 100) };
+    if (!allowAttempt(name)) {
+      record({ ...ev, event: EVENT_LOGIN_FAIL, reason: '已锁定' });
+      return sendJson(res, 429, { error: 'rate_limited' });
     }
+    /** 按账号查到的行，拒绝时把它们的「状态」一起对一遍 */
+    let found: AccountRow[] = [];
+    const refuse = (row: AccountRow | null, reason: string) => {
+      const lockedNow = recordFailure(name) !== null;
+      // 凑满 5 次时 writeStatuses 会把这一行写成「已锁定」和解锁时间。
+      writeStatuses(found);
+      if (lockedNow) reason += '（连错 5 次，已锁定）';
+      console.log(`sso: account login ${JSON.stringify(name)} refused: ${reason}`);
+      record({ ...ev, recordId: row?.id ?? ev.recordId, event: EVENT_LOGIN_FAIL, reason });
+      sendJson(res, 401, { error: 'auth_failed' });
+    };
+    if (!accountsTable) return refuse(null, '本项目没开账号密码登录');
+    if (!name) return refuse(null, '没填账号');
+    if (!password) return refuse(null, '没填密码');
+    let rows: AccountRow[];
+    try {
+      rows = found = await findAccount(name);
+    } catch (e) {
+      console.log(`sso: account login ${JSON.stringify(name)}: accounts table: ${describe(e)}`);
+      record({ ...ev, event: EVENT_LOGIN_FAIL, reason: '查表失败' });
+      return sendJson(res, 503, { error: 'login_service_unavailable' });
+    }
+    const [row, reason] = loginVerdict(rows, password);
+    if (reason || !row) return refuse(row, reason);
     fails.delete(name);
-    const identity: Identity = { company_code: ACCOUNT_COMPANY_CODE, sub: acct.username.toLowerCase(), name: acct.name };
+    const identity: Identity = { company_code: ACCOUNT_COMPANY_CODE, sub: row.id, name: row.username.trim() };
+    ev = { ...withIdentity(ev, identity), recordId: row.id };
     let userId: string;
     try {
       userId = await opts.onLogin(identity);
     } catch (e) {
-      if (e instanceof NotAllowedError) {
-        console.log(`sso: project refused ${identityKey(identity)}`);
-        return sendJson(res, 401, { error: 'auth_failed' });
-      }
+      if (e instanceof NotAllowedError) return refuse(row, '本项目不让进');
       console.log(`sso: onLogin ${identityKey(identity)}: ${describe(e)}`);
+      record({ ...ev, event: EVENT_LOGIN_FAIL, reason: 'onLogin 出错' });
       return sendJson(res, 503, { error: 'login_service_unavailable' });
     }
     const sid = randomBytes(32).toString('base64url');
     const now = Date.now();
+    const session: Session = { idHash: hashId(sid), userId, identity, refreshSeal: '', createdAt: now, checkedAt: now, lastSeenAt: now, version: 1, account: true, accountCredential: credential(row.password), features: checkedFeatures(row) };
     try {
-      await store.createSession({ idHash: hashId(sid), userId, identity, refreshSeal: '', createdAt: now, checkedAt: now, lastSeenAt: now, version: 1, account: true, accountCredential: acct.credential });
+      await store.createSession(session);
     } catch (e) {
       console.log(`sso: create session: ${describe(e)}`);
+      record({ ...ev, event: EVENT_LOGIN_FAIL, reason: '建会话失败' });
       return sendJson(res, 503, { error: 'login_service_unavailable' });
     }
     setCookie(res, SESSION_COOKIE, sid, SESSION_IDLE_MS + TOUCH_EVERY_MS);
     console.log(`sso: login ${identityKey(identity)} user=${userId}`);
+    writeBack(row.id, { [COL_STATUS]: STATUS_OK, [COL_NOTE]: '', [COL_LAST_LOGIN]: now });
+    record({ ...ev, event: EVENT_LOGIN_OK, session: sessionTag(session.idHash), permissions: permissionColumns(session.features!) });
     sendJson(res, 200, { ok: true });
   };
 
-  // 每个核对周期查一次账号还在不在、到没到期、密码重置过没有；账号表读不到时普通接口最多再放行 15 分钟。
-  const checkAccount = async (sess: Session): Promise<Session | 401 | 503> => {
-    let active: boolean;
-    try {
-      active = accounts ? await accounts.active(sess.identity.sub, sess.accountCredential ?? '') : false;
-    } catch (e) {
-      console.log(`sso: check account ${sess.identity.sub}: ${describe(e)}`);
-      return Date.now() - sess.checkedAt < checkEveryMs + OUTAGE_GRACE_MS ? sess : 503;
-    }
-    if (!active) {
-      console.log(`sso: account ${sess.identity.sub} gone, expired or password reset, ending session`);
-      await endSession(sess.idHash).catch(() => {});
-      return 401;
-    }
-    const next = { ...sess, checkedAt: Date.now() };
-    try {
-      await store.updateSession(next, sess.version);
-    } catch {
+  // 每个核对周期按 record_id 读一次那一行：删了、账号状态不是启用、密码改了就下线，否则更新功能和名字。
+  // 账号表读不到时普通接口最多再放行 15 分钟。
+  const checkAccount = (req: Req, sess: Session): Promise<Session | 401 | 503> => {
+    if (!accountsTable) return revokeSession(req, sess.idHash, '本项目没开账号密码登录').then(() => 401 as const);
+    return withLock(sess.idHash, async (): Promise<Session | 401 | 503> => {
+      let cur: Session | null;
       try {
-        return (await store.getSession(sess.idHash)) ?? 401;
+        cur = await store.getSession(sess.idHash);
       } catch {
         return 503;
       }
-    }
-    return { ...next, version: sess.version + 1 };
+      if (!cur) return 401;
+      if (Date.now() - cur.checkedAt < checkEveryMs) return cur;
+      const inGrace = Date.now() - cur.checkedAt < checkEveryMs + OUTAGE_GRACE_MS;
+      if (Date.now() < (retryAfter.get(cur.idHash) ?? 0)) return inGrace ? cur : 503;
+      let rec: BitableRecord | null;
+      try {
+        rec = await feishu!.get(accountsTable, cur.identity.sub);
+      } catch (e) {
+        accountsRead(e);
+        console.log(`sso: check account ${cur.identity.sub}: ${describe(e)}`);
+        retryAfter.set(cur.idHash, Date.now() + OUTAGE_BACKOFF_MS);
+        return inGrace ? cur : 503;
+      }
+      accountsRead(null);
+      retryAfter.delete(cur.idHash);
+      if (!rec) {
+        await revokeSession(req, cur.idHash, '账号已删除');
+        return 401;
+      }
+      const row = parseAccountRow(rec);
+      const reason = revokeReason(row, cur.accountCredential ?? '');
+      if (reason) {
+        console.log(`sso: account ${cur.identity.sub} ${reason}, ending session`);
+        await revokeSession(req, cur.idHash, reason);
+        return 401;
+      }
+      const next: Session = { ...cur, checkedAt: Date.now(), identity: { ...cur.identity, name: row.username.trim() }, features: checkedFeatures(row) };
+      try {
+        await store.updateSession(next, cur.version);
+      } catch {
+        try {
+          return (await store.getSession(cur.idHash)) ?? 401;
+        } catch {
+          return 503;
+        }
+      }
+      return { ...next, version: cur.version + 1 };
+    });
   };
+
+  // ---------- 兜底对账、账号表变更提醒 ----------
+
+  /** 查两张表的列，换上新的表结构问题；有一张读不到返回 false */
+  const checkSchema = async () => {
+    let ok = true;
+    if (accountsTable) {
+      try {
+        const fields = await feishu!.fields(accountsTable);
+        accountsRead(null);
+        setIssues('accounts', accountSchemaIssues(fields, features));
+      } catch (e) {
+        accountsRead(e);
+        console.log(`sso: accounts table fields: ${describe(e)}`);
+        ok = false;
+      }
+    }
+    if (logTable) {
+      try {
+        setIssues('log', columnIssues('log_column:', await feishu!.fields(logTable), LOG_COLUMNS));
+      } catch (e) {
+        console.log(`sso: log table fields: ${describe(e)}`);
+        ok = false;
+      }
+    }
+    return ok;
+  };
+
+  /** 把同一个账号名的几行的「状态」「状态说明」算一遍，对不上的写回 */
+  const writeStatuses = (rows: AccountRow[]) => {
+    const locked = lockedNames();
+    for (const row of rows) {
+      if (isBlank(row)) continue;
+      const [status, note] = accountRowStatus({ row, duplicate: rows.length > 1, lockedUntil: locked.get(normalizeUsername(row.username)) ?? 0 });
+      if (status !== row.status || note !== row.note) writeBack(row.id, { [COL_STATUS]: status, [COL_NOTE]: note });
+    }
+  };
+
+  /** 按刚读到的那一行处理一个账号会话（row 为 null 是那一行删了）：删了、账号状态不是启用、密码改了就下线，返回 false；否则更新名字和功能 */
+  const settleAccountSession = async (sess: Session, row: AccountRow | null) => {
+    const reason = row ? revokeReason(row, sess.accountCredential ?? '') : '账号已删除';
+    if (reason) {
+      console.log(`sso: account ${sess.identity.sub} ${reason}, ending session`);
+      await revokeSession(null, sess.idHash, reason);
+      return false;
+    }
+    // 版本对不上就算了：用户的下一个请求还会核对。
+    await store.updateSession({ ...sess, checkedAt: Date.now(), identity: { ...sess.identity, name: row!.username.trim() }, features: checkedFeatures(row!) }, sess.version).catch(() => {});
+    return true;
+  };
+
+  /** 兜底对账的一轮里读表的部分：查两张表的结构；整表读账号表，收回已删除、已停用、改了密码的账号会话，「状态」对不上的行写回 */
+  const reconcileOnce = async () => {
+    if (!(await checkSchema())) return false;
+    if (!accountsTable) return true;
+    const readAt = Date.now();
+    let recs: BitableRecord[];
+    try {
+      recs = await feishu!.search(accountsTable, null, null, 200);
+      accountsRead(null);
+    } catch (e) {
+      accountsRead(e);
+      console.log(`sso: accounts table reconcile: ${describe(e)}`);
+      return false;
+    }
+    let sessions: Session[];
+    try {
+      sessions = await store.accountSessions();
+    } catch (e) {
+      console.log(`sso: reconcile: load account sessions: ${describe(e)}`);
+      return false;
+    }
+    const rows = new Map<string, AccountRow>();
+    const groups = new Map<string, AccountRow[]>();
+    for (const row of recs.map(parseAccountRow)) {
+      rows.set(row.id, row);
+      const key = normalizeUsername(row.username);
+      groups.set(key, [...(groups.get(key) ?? []), row]);
+    }
+    let ended = 0;
+    for (const sess of sessions) {
+      // 读表之后才登录或核对过的会话不动：它比这份表新。
+      if (sess.checkedAt > readAt) continue;
+      if (!(await settleAccountSession(sess, rows.get(sess.identity.sub) ?? null))) ended++;
+    }
+    for (const g of groups.values()) writeStatuses(g);
+    console.log(`sso: reconcile: ${recs.length} account rows, ${sessions.length} sessions checked, ${ended} ended`);
+    return true;
+  };
+
+  /** record_id → 处理完要不要再来一遍（正在处理时又来了提醒） */
+  const changing = new Map<string, boolean>();
+  let changedTimes: number[] = [];
+  /** 同一行正在处理时只记一笔「处理完再来一遍」；全局最近一分钟最多处理 60 次，多的丢掉（用户下一个请求照样会核对） */
+  const claimChange = (id: string) => {
+    if (changing.has(id)) {
+      changing.set(id, true);
+      return false;
+    }
+    const now = Date.now();
+    changedTimes = changedTimes.filter((t) => now - t <= MINUTE);
+    if (changedTimes.length >= ACCOUNTS_CHANGED_PER_MINUTE) return false;
+    changedTimes.push(now);
+    changing.set(id, false);
+    return true;
+  };
+
+  /** 读那一行：删了、账号状态不是启用、密码改了，就让绑在这一行上的会话全部下线；否则更新名字和功能。最后把同名几行的「状态」对一遍 */
+  const applyAccountChange = async (id: string) => {
+    await checkSchema();
+    let rec: BitableRecord | null;
+    try {
+      rec = await feishu!.get(accountsTable!, id);
+      accountsRead(null);
+    } catch (e) {
+      accountsRead(e);
+      console.log(`sso: accounts-changed ${id}: ${describe(e)}`);
+      return;
+    }
+    const sessions = await store.accountSessions().catch((e) => {
+      console.log(`sso: accounts-changed ${id}: load sessions: ${describe(e)}`);
+      return [] as Session[];
+    });
+    const row = rec ? parseAccountRow(rec) : null;
+    for (const sess of sessions) if (sess.identity.sub === id) await settleAccountSession(sess, row);
+    if (!row) return;
+    // 同名的几行一起对（这一行改了名，可能和别的行重了）。
+    let group = [row];
+    const name = normalizeUsername(row.username);
+    if (name) {
+      const rows = await findAccount(name).catch(() => null);
+      if (rows) group = rows.some((r) => r.id === id) ? rows : [...rows, row];
+    }
+    writeStatuses(group);
+  };
+
+  const processChanges = async (id: string) => {
+    for (;;) {
+      await applyAccountChange(id).catch((e) => console.log(`sso: accounts-changed ${id}: ${describe(e)}`));
+      if (!changing.get(id)) {
+        changing.delete(id);
+        return;
+      }
+      changing.set(id, false);
+    }
+  };
+
+  // 账号表的自动化在人改了账号、密码、账号状态、功能列后 POST {"record_id":"rec…"}。
+  // 提醒不需要密钥，伪造了也无害：马上回 202、不回任何数据，只当场读那一行。
+  const handleAccountsChanged = async (req: Req, res: Res) => {
+    let id = '';
+    try {
+      const body = req.body !== undefined ? req.body : JSON.parse(await readBody(req, 4096));
+      id = String((body as { record_id?: unknown })?.record_id ?? '');
+    } catch {}
+    res.statusCode = 202;
+    res.end();
+    if (accountsTable && RECORD_ID.test(id) && claimChange(id)) void processChanges(id);
+  };
+
+  // 一张表一个写入循环，互不耽误：有东西进来就写，写的时候新进来的攒着下一次一起写；
+  // 失败才按 1 秒起翻倍、最长 5 分钟退避重试（日志表写满了也一样，登录和请求照常）。
+  // 日志表每写 500 行查一次总行数，超了按上限删最旧的请求日志；启动时也查一次。
+  const deliver = async (target: Target, batch: OutboxItem[]) => {
+    if (target === 'log') return feishu!.batchCreate(logTable!, batch.map((it) => it.fields));
+    const recs = batch.map((it) => ({ record_id: it.recordId!, fields: it.fields }));
+    try {
+      await feishu!.batchUpdate(accountsTable!, recs);
+    } catch (e) {
+      if (!(e instanceof RecordNotFoundError)) throw e;
+      // 有一行已被人删了：逐行写，删掉的那行就不用写了。
+      for (const rec of recs) {
+        await feishu!.batchUpdate(accountsTable!, [rec]).catch((err) => {
+          if (!(err instanceof RecordNotFoundError)) throw err;
+        });
+      }
+    }
+  };
+
+  /** 日志表总行数超过 SSO_LOG_MAX_ROWS 时，删最旧的「请求」行（不分项目，日志表是共用的），删到上限的 90%；登录、退出、被收回的行永远不删 */
+  const trimLogTable = async () => {
+    let total: number;
+    try {
+      total = await feishu!.count(logTable!, null);
+    } catch (e) {
+      console.log(`sso: log table count: ${describe(e)}`);
+      return;
+    }
+    if (total <= logMaxRows) return;
+    const target = Math.floor((logMaxRows * 9) / 10);
+    const onlyRequests = { conjunction: 'and', conditions: [{ field_name: '类型', operator: 'is', value: [TYPE_REQUEST] }] };
+    const oldestFirst = [{ field_name: '时间', desc: false }];
+    let deleted = 0;
+    try {
+      while (total > target) {
+        const recs = await feishu!.searchPage(logTable!, onlyRequests, oldestFirst, Math.min(OUTBOX_BATCH, total - target));
+        if (!recs.length) break;
+        await feishu!.batchDelete(logTable!, recs.map((r) => r.record_id));
+        total -= recs.length;
+        deleted += recs.length;
+      }
+    } catch (e) {
+      console.log(`sso: log table trim: ${describe(e)}`);
+    }
+    console.log(`sso: log table over ${logMaxRows} rows, deleted the ${deleted} oldest request rows`);
+  };
+
+  if (outbox) {
+    const ob = outbox;
+    for (const target of ob.targets()) {
+      void (async () => {
+        let backoff = 1000;
+        let written = 0;
+        if (target === 'log') await trimLogTable();
+        for (;;) {
+          const batch = ob.take(target);
+          if (!batch.length) {
+            await ob.waitFor(target);
+            continue;
+          }
+          let err: unknown = null;
+          await deliver(target, batch).catch((e) => (err = e ?? new Error('failed')));
+          ob.finish(batch, err === null);
+          if (err !== null) {
+            console.log(`sso: outbox ${target}: ${batch.length} not written, retry in ${backoff / 1000}s: ${describe(err)}`);
+            // 写不进去可能是有人改了列：顺手查一次表结构，健康检查报得出是哪一列。
+            await checkSchema().catch(() => {});
+            await ob.pause(target, backoff);
+            backoff = Math.min(backoff * 2, OUTBOX_MAX_BACKOFF_MS);
+            continue;
+          }
+          backoff = 1000;
+          if (target === 'log' && (written += batch.length) >= LOG_TRIM_EVERY) {
+            written = 0;
+            await trimLogTable();
+          }
+        }
+      })();
+    }
+  }
 
   // ---------- 会话 ----------
 
@@ -500,7 +1071,7 @@ export async function createSso(opts: Options): Promise<Sso> {
 
   // 用 refresh_token 换新的 access_token，再调用户信息：集成平台的「禁止访问」拦在用户信息接口，
   // 刷新本身照样成功，所以只看刷新成不成功没有用。
-  const check = (idHash: string, fresh: boolean) =>
+  const check = (req: Req, idHash: string, fresh: boolean) =>
     withLock(idHash, async (): Promise<Session | typeof REJECTED | typeof UNAVAILABLE | typeof STORE_DOWN> => {
       let cur: Session | null;
       try {
@@ -512,7 +1083,7 @@ export async function createSso(opts: Options): Promise<Sso> {
       if (!fresh && Date.now() - cur.checkedAt < checkEveryMs) return cur;
       const rt = open('refresh-token', cur.refreshSeal);
       if (!rt) {
-        await endSession(idHash);
+        await revokeSession(req, idHash, '会话里的令牌解不开');
         return REJECTED;
       }
       let next: Awaited<ReturnType<typeof refreshGrant>>;
@@ -521,7 +1092,8 @@ export async function createSso(opts: Options): Promise<Sso> {
       } catch (e) {
         if (e instanceof RejectedError) {
           console.log(`sso: refresh rejected for ${identityKey(cur.identity)}: ${describe(e)}`);
-          await store.deleteSession(idHash);
+          const gone = await store.deleteSession(idHash);
+          if (gone) recordRevoked(req, gone, '集成平台拒绝刷新');
           return REJECTED;
         }
         console.log(`sso: refresh unavailable: ${describe(e)}`);
@@ -534,7 +1106,8 @@ export async function createSso(opts: Options): Promise<Sso> {
       } catch (e) {
         if (e instanceof DeniedError) {
           console.log(`sso: ${identityKey(cur.identity)} denied by idp, ending session`);
-          await store.deleteSession(idHash);
+          const gone = await store.deleteSession(idHash);
+          if (gone) recordRevoked(req, gone, '集成平台禁止访问');
           await revoke(newRt);
           return REJECTED;
         }
@@ -581,8 +1154,12 @@ export async function createSso(opts: Options): Promise<Sso> {
       console.log(`sso: load session or blocklist: ${describe(e)}`);
       return 503;
     }
+    if (hit) {
+      await revokeSession(req, sess.idHash, '停用名单：' + hit.reason);
+      return 401;
+    }
     // 滑动续期的时间每小时才写一次，多留一小时，保证 30 天没用才过期。
-    if (hit || Date.now() - sess.lastSeenAt > SESSION_IDLE_MS + TOUCH_EVERY_MS) {
+    if (Date.now() - sess.lastSeenAt > SESSION_IDLE_MS + TOUCH_EVERY_MS) {
       await endSession(sess.idHash).catch(() => {});
       return 401;
     }
@@ -590,12 +1167,12 @@ export async function createSso(opts: Options): Promise<Sso> {
       // 敏感接口只认集成平台身份：账号密码没法当场找集成平台核对。
       if (fresh) return 403;
       if (Date.now() - sess.checkedAt < checkEveryMs) return sess;
-      return checkAccount(sess);
+      return checkAccount(req, sess);
     }
     if (!fresh && Date.now() - sess.checkedAt < checkEveryMs) return sess;
     const inGrace = !fresh && Date.now() - sess.checkedAt < checkEveryMs + OUTAGE_GRACE_MS;
     if (!fresh && Date.now() < (retryAfter.get(sess.idHash) ?? 0)) return inGrace ? sess : 503;
-    const r = await check(sess.idHash, fresh);
+    const r = await check(req, sess.idHash, fresh);
     if (r === REJECTED) return 401;
     if (r === STORE_DOWN) return 503;
     if (r === UNAVAILABLE) {
@@ -613,6 +1190,8 @@ export async function createSso(opts: Options): Promise<Sso> {
   };
 
   const guard = (fresh: boolean): Handler => (req, res, next) => {
+    const note = notes.get(req);
+    if (note && fresh) note.fresh = true;
     authenticate(req, fresh)
       .then(async (sess) => {
         if (sess === 401) {
@@ -625,7 +1204,8 @@ export async function createSso(opts: Options): Promise<Sso> {
           const touched = await store.updateSession({ ...sess, lastSeenAt: Date.now() }, sess.version).then(() => true, () => false);
           if (touched) setCookie(res, SESSION_COOKIE, readCookies(req)[SESSION_COOKIE], SESSION_IDLE_MS + TOUCH_EVERY_MS);
         }
-        req.ssoUser = { ...sess.identity, id: sess.userId };
+        if (note) note.sess = sess;
+        req.ssoUser = { ...sess.identity, id: sess.userId, features: featuresOf(sess) };
         next();
       })
       .catch(next);
@@ -635,15 +1215,71 @@ export async function createSso(opts: Options): Promise<Sso> {
   const handleLogout = async (req: Req, res: Res) => {
     const sid = readCookies(req)[SESSION_COOKIE];
     if (sid) {
+      let gone: Session | null;
       try {
-        await endSession(hashId(sid));
+        gone = await endSession(hashId(sid));
       } catch (e) {
         console.log(`sso: logout: ${describe(e)}`);
         return sendJson(res, 503, { error: 'logout_failed' });
       }
+      if (gone) record(sessionEvent(requestEvent(req, ''), gone, EVENT_LOGOUT));
     }
     setCookie(res, SESSION_COOKIE, '', -1);
     sendJson(res, 200, { ok: true });
+  };
+
+  // 给监控读：不带个人信息、表 ID、错误原文。有问题回 503。
+  const handleHealth = (_req: Req, res: Res) => {
+    const problems = [...issues.accounts.keys(), ...issues.log.keys()];
+    if (accountsFailed) problems.push('accounts_unreachable');
+    let pending = 0;
+    let oldest = 0;
+    let dropped = 0;
+    if (outbox) {
+      const st = outbox.stats();
+      pending = st.pending;
+      dropped = st.dropped;
+      if (st.oldest) oldest = Math.floor((Date.now() - st.oldest) / 1000);
+      if (st.droppedAt && Date.now() - st.droppedAt < DROPPED_WARN_MS) problems.push('warn_request_rows_dropped');
+      if (oldest * 1000 > OUTBOX_STALE_MS) problems.push('outbox_stale');
+      if (pending > OUTBOX_BACKLOG_LIMIT) problems.push('outbox_backlog');
+      if (st.saveFailed) problems.push('outbox_write_failed');
+    }
+    problems.sort();
+    const ok = problems.every((p) => p.startsWith('warn_'));
+    sendJson(res, ok ? 200 : 503, { ok, outbox_pending: pending, oldest_pending_seconds: oldest, dropped_request_rows: dropped, problems });
+  };
+
+  // ---------- 请求日志 ----------
+
+  const logRequest = (req: Req, note: RequestNote, status: number, tookMs: number) => {
+    const mutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method ?? '');
+    if (!(status === 401 || status === 403 || status >= 500 || mutating || note.fresh || note.audit)) return;
+    const ev: LoginEvent = {
+      ...requestEvent(req, ''),
+      event: EVENT_REQUEST,
+      verb: req.method,
+      path: clip(requestPath(req), 500),
+      status,
+      durationMs: Math.round(tookMs),
+      reason: status === 401 ? '没登录' : status === 403 ? '没有权限' : status >= 500 ? '服务出错' : '',
+    };
+    const sid = readCookies(req)[SESSION_COOKIE];
+    void (async () => {
+      const sess = note.sess ?? (sid ? await store.getSession(hashId(sid)).catch(() => null) : null);
+      const row = sess ? sessionEvent(ev, sess, EVENT_REQUEST, ev.reason) : ev;
+      row.mergeKey = [row.verb, row.path, status, sess ? identityKey(sess.identity) : 'ip:' + ev.ip].join('\x00');
+      record(row);
+    })();
+  };
+
+  const logRequests: Handler = (req, res, next) => {
+    if (!logTable || OWN_PATHS.has(requestPath(req))) return next();
+    const start = performance.now();
+    const note: RequestNote = {};
+    notes.set(req, note);
+    res.once('finish', () => logRequest(req, note, res.statusCode, performance.now() - start));
+    next();
   };
 
   // ---------- 停用名单 ----------
@@ -680,7 +1316,10 @@ export async function createSso(opts: Options): Promise<Sso> {
       return;
     }
     const kicked = await store.deleteSessionsBySub(next.entries);
-    for (const s of kicked) retryAfter.delete(s.idHash);
+    for (const s of kicked) {
+      retryAfter.delete(s.idHash);
+      recordRevoked(null, s, '停用名单：' + (next.entries[s.identity.sub]?.reason ?? ''));
+    }
     void (async () => {
       for (const s of kicked) await revoke(open('refresh-token', s.refreshSeal) ?? undefined);
     })();
@@ -704,7 +1343,21 @@ export async function createSso(opts: Options): Promise<Sso> {
       await sleep(syncGapMs);
     }
   })();
-  wakeSync();
+
+  // 兜底对账：事件丢了时的兜底，跟着进程启动、不会停：先跑一轮，之后每 SSO_RECONCILE_INTERVAL 一轮。
+  // 一轮：重拉停用名单；待写队列有积压就马上排一次；再读表（reconcileOnce），失败按 1 秒起翻倍重试（最长 5 分钟），成功了再等下一轮。
+  void (async function reconcileLoop() {
+    for (;;) {
+      wakeSync();
+      outbox?.kickBacklog();
+      let backoff = 1000;
+      while (!(await reconcileOnce().catch(() => false))) {
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, OUTBOX_MAX_BACKOFF_MS, reconcileEveryMs);
+      }
+      await sleep(reconcileEveryMs);
+    }
+  })();
 
   // 提醒不带名单、不需要密钥：假提醒最多让项目多读一次名单，名单只从集成平台读。
   const handleBlocklistChanged = async (req: Req, res: Res) => {
@@ -734,18 +1387,195 @@ export async function createSso(opts: Options): Promise<Sso> {
         return void run(handleLogout(req, res));
       case `POST ${BLOCKLIST_PATH}`:
         return void run(handleBlocklistChanged(req, res));
+      case `POST ${ACCOUNTS_CHANGED_PATH}`:
+        return void run(handleAccountsChanged(req, res));
+      case `GET ${HEALTH_PATH}`:
+        return void run(handleHealth(req, res));
       case `GET ${ME_PATH}`:
         return meHandler(req, res, (err) => {
           if (err) return next(err);
           const u = req.ssoUser!;
-          sendJson(res, 200, { id: u.id, name: u.name, avatar_url: u.picture ?? '', company_code: u.company_code });
+          sendJson(res, 200, { id: u.id, name: u.name, avatar_url: u.picture ?? '', company_code: u.company_code, features: u.features });
         });
     }
     next();
   };
 
-  return { routes, requireUser: guard(false), requireFreshUser: guard(true) };
+  return { routes, logRequests, requireUser: guard(false), requireFreshUser: guard(true) };
 }
+
+// ---------- 账号表的行 ----------
+
+/** 账号表的一行。username、password 保留原样（判断前后空格要用） */
+interface AccountRow {
+  id: string;
+  username: string;
+  password: string;
+  /** 账号状态 */
+  enabled: string;
+  /** 状态、状态说明（系统写的） */
+  status: string;
+  note: string;
+  remark: string;
+  checked: Set<string>;
+}
+
+/**
+ * 兼容两种格子写法：查询接口里文本是 [{"type":"text","text":"…"}] 分段（可能多段），
+ * 按 ID 取时是纯字符串；空格子在查询里不出现、按 ID 取时是 null。
+ */
+function parseAccountRow(rec: BitableRecord): AccountRow {
+  const f = rec.fields ?? {};
+  return {
+    id: rec.record_id,
+    username: cellText(f[COL_USERNAME]),
+    password: cellText(f[COL_PASSWORD]),
+    enabled: cellText(f[COL_ENABLED]),
+    status: cellText(f[COL_STATUS]),
+    note: cellText(f[COL_NOTE]),
+    remark: cellText(f['备注']),
+    checked: new Set(Object.keys(f).filter((k) => f[k] === true)),
+  };
+}
+
+function cellText(v: unknown): string {
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v.map((seg) => (typeof seg === 'string' ? seg : typeof seg?.text === 'string' ? seg.text : '')).join('');
+  if (v && typeof v === 'object' && typeof (v as { text?: unknown }).text === 'string') return (v as { text: string }).text;
+  return '';
+}
+
+/** 整行人填的格子都空着（多维表格新建时自带的空行），不去写它 */
+const isBlank = (r: AccountRow) => !r.username && !r.password && !r.enabled && !r.remark;
+
+const normalizeUsername = (v: string) => v.trim().toLowerCase();
+
+/** 「账号状态」不是启用时的原因：只有一字不差的「启用」能登录，空的、禁用、改了名的选项都不行 */
+const enabledRefusal = (v: string) => (v === '' || v === DISABLED_VALUE ? '账号已停用' : '账号状态的值不认识：' + v);
+const knownEnabled = (v: string) => v === '' || v === ENABLED_VALUE || v === DISABLED_VALUE;
+
+const lockNote = (until: number) => {
+  const d = new Date(until + 8 * 3600_000);
+  return `连续输错 ${ACCOUNT_FAIL_LIMIT} 次，${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')} 后自动解锁`;
+};
+
+interface RowFacts {
+  row: AccountRow;
+  duplicate: boolean;
+  /** 0 是没锁 */
+  lockedUntil: number;
+}
+
+/** 按顺序判一行的「状态」和「状态说明」，第一条对上的算数；都不对上就是正常 */
+const ACCOUNT_ROW_RULES: { applies: (f: RowFacts) => boolean; status: string; note: (f: RowFacts) => string }[] = [
+  { applies: (f) => !f.row.username.trim(), status: STATUS_MISCONFIGURED, note: () => '缺账号' },
+  { applies: (f) => f.row.username !== f.row.username.trim(), status: STATUS_MISCONFIGURED, note: () => '账号前后有空格' },
+  { applies: (f) => !f.row.password.trim(), status: STATUS_MISCONFIGURED, note: () => '缺密码' },
+  { applies: (f) => f.duplicate, status: STATUS_MISCONFIGURED, note: () => '账号重复' },
+  { applies: (f) => !knownEnabled(f.row.enabled), status: STATUS_MISCONFIGURED, note: (f) => '账号状态的值不认识：' + f.row.enabled },
+  { applies: (f) => f.row.enabled !== ENABLED_VALUE, status: STATUS_DISABLED, note: (f) => (f.row.enabled === '' ? '账号状态没选，选「启用」才能登录' : '') },
+  { applies: (f) => f.lockedUntil > 0, status: STATUS_LOCKED, note: (f) => lockNote(f.lockedUntil) },
+];
+
+function accountRowStatus(f: RowFacts): [string, string] {
+  for (const rule of ACCOUNT_ROW_RULES) if (rule.applies(f)) return [rule.status, rule.note(f)];
+  return [STATUS_OK, ''];
+}
+
+/** 检查账号表的列：系统要读写的列、代码里声明的功能列都得在、类型都得对；没声明的复选框只提醒 */
+function accountSchemaIssues(fields: TableField[], features: Feature[]): Map<string, string> {
+  const issues = columnIssues('accounts_column:', fields, ACCOUNT_COLUMNS);
+  const byName = new Map(fields.map((f) => [f.field_name, f]));
+  const declared = new Set(features.map((f) => f.column));
+  for (const feat of features) {
+    const f = byName.get(feat.column);
+    if (!f) issues.set('feature_column:' + feat.key, `复选框列「${feat.column}」不存在，功能 ${feat.key} 对所有人关掉`);
+    else if (f.type !== FIELD_CHECKBOX) issues.set('feature_column:' + feat.key, `列「${feat.column}」类型是 ${f.type} 不是复选框，功能 ${feat.key} 对所有人关掉`);
+  }
+  for (const f of fields) if (f.type === FIELD_CHECKBOX && !declared.has(f.field_name)) issues.set('warn_undeclared_checkbox:' + f.field_name, `复选框列「${f.field_name}」代码里没声明，不起作用`);
+  return issues;
+}
+
+function columnIssues(prefix: string, fields: TableField[], want: Column[]): Map<string, string> {
+  const byName = new Map(fields.map((f) => [f.field_name, f]));
+  const issues = new Map<string, string>();
+  for (const [name, type] of want) {
+    const f = byName.get(name);
+    if (!f) issues.set(prefix + name, `列「${name}」不存在`);
+    else if (f.type !== type && !(type === FIELD_LINK && f.type === FIELD_DUPLEX)) issues.set(prefix + name, `列「${name}」类型是 ${f.type}，应为 ${type}`);
+  }
+  return issues;
+}
+
+function validateFeatures(features: Feature[]) {
+  const keys = new Set<string>();
+  const cols = new Set(ACCOUNT_COLUMNS.map(([n]) => n));
+  for (const f of features) {
+    if (!f.key || !f.column || keys.has(f.key) || cols.has(f.column)) throw new Error(`sso: features: key and column must be non-empty and unique, column not one of the system columns: ${JSON.stringify(f)}`);
+    keys.add(f.key);
+    cols.add(f.column);
+  }
+}
+
+// ---------- 登录日志小工具 ----------
+
+/** 依次认 X-Real-IP、X-Forwarded-For 第一个、直连地址，并记下用的是哪个 */
+function clientIp(req: IncomingMessage): [string, string] {
+  const real = String(req.headers['x-real-ip'] ?? '').trim();
+  if (real) return [real, 'X-Real-IP'];
+  const first = String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim();
+  if (first) return [first, 'X-Forwarded-For'];
+  return [(req.socket.remoteAddress ?? '').replace(/^::ffff:/, ''), 'RemoteAddr'];
+}
+
+function requestEvent(req: IncomingMessage, method: string): LoginEvent {
+  const [ip, ipSource] = clientIp(req);
+  return { method, ip, ipSource, browser: String(req.headers['user-agent'] ?? '') };
+}
+
+const withIdentity = (ev: LoginEvent, id: Identity): LoginEvent => ({ ...ev, company: id.company_code, subject: id.sub, name: id.name, email: id.email });
+
+/** 本模板自己的路由不记请求日志：登录、退出另有登录日志，/api/me 和两个提醒、健康检查是探针 */
+const OWN_PATHS = new Set([LOGIN_PATH, CALLBACK_PATH, ACCOUNT_PATH, LOGOUT_PATH, ME_PATH, BLOCKLIST_PATH, ACCOUNTS_CHANGED_PATH, HEALTH_PATH]);
+
+/** 不带查询串的路径；Express 子路由会改写 req.url，用 originalUrl */
+const requestPath = (req: IncomingMessage) => new URL((req as IncomingMessage & { originalUrl?: string }).originalUrl ?? req.url ?? '/', 'http://x').pathname;
+
+/** 把事件拆成日志的「类型」「结果」；被收回不写结果 */
+function typeAndResult(e: LoginEvent): [string, string] {
+  switch (e.event) {
+    case EVENT_LOGIN_OK:
+      return [TYPE_LOGIN, RESULT_OK];
+    case EVENT_LOGIN_FAIL:
+      return [TYPE_LOGIN, RESULT_FAIL];
+    case EVENT_LOGOUT:
+      return [TYPE_LOGOUT, RESULT_OK];
+    case EVENT_REQUEST:
+      return [TYPE_REQUEST, (e.status ?? 0) < 400 ? RESULT_OK : RESULT_FAIL];
+  }
+  return [TYPE_REVOKED, ''];
+}
+
+function summary(e: LoginEvent): string {
+  let who: string;
+  if (e.method === METHOD_ACCOUNT && (e.account || e.name)) who = `账号 ${e.account || e.name} `;
+  else if (e.method === METHOD_ACCOUNT) who = '账号密码';
+  else if (e.name) who = `${e.name}（飞书）`;
+  else if (e.event === EVENT_REQUEST && !e.company) who = '未登录 ';
+  else who = '飞书';
+  let what = e.event ?? '';
+  if (e.event === EVENT_REQUEST) {
+    if (!who.endsWith(' ') && !who.endsWith('）')) who += ' ';
+    what = `${e.verb} ${e.path} ${e.status}`;
+  }
+  return e.reason ? `${who}${what}：${e.reason}` : `${who}${what}`;
+}
+
+/** 会话 ID 哈希的前 12 位，日志里能把同一个会话的几行串起来，又倒推不出会话 ID */
+const sessionTag = (idHash: string) => idHash.slice(0, 12);
+/** 只留外部传来的错误码里的安全字符 */
+const cleanCode = (v: string) => clip(v.replace(/[^A-Za-z0-9_.-]/g, ''), 64);
+const clip = (v: string, max: number) => [...v].slice(0, max).join('');
 
 // ---------- 小工具 ----------
 
@@ -754,10 +1584,47 @@ const hashId = (sid: string) => createHash('sha256').update(sid).digest('hex');
 const txnCookieName = (state: string) => TXN_COOKIE_PREFIX + state.slice(0, 16);
 const describe = (e: unknown) => (e instanceof oidc.ResponseBodyError ? `HTTP ${e.status} ${e.error}` : e instanceof Error ? `${e.name}: ${e.message}` : String(e));
 
-function parseDuration(v: string): number {
-  const m = /^(\d+(?:\.\d+)?)(ms|s|m)$/.exec(v.trim());
-  if (!m) throw new Error(`sso: bad SSO_CHECK_INTERVAL ${v}`);
-  return Number(m[1]) * { ms: 1, s: 1000, m: 60_000 }[m[2] as 'ms' | 's' | 'm'];
+/** 读 2s、10m、6h 这样的时长；没配用默认值 */
+function envDuration(name: string, fallback: number): number {
+  const v = (process.env[name] ?? '').trim();
+  if (!v) return fallback;
+  const m = /^(\d+(?:\.\d+)?)(ms|s|m|h)$/.exec(v);
+  if (!m || Number(m[1]) <= 0) throw new Error(`sso: bad ${name} ${v}`);
+  return Number(m[1]) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[m[2] as 'ms' | 's' | 'm' | 'h'];
+}
+
+interface TableRef {
+  app: string;
+  table: string;
+}
+
+const RECORD_ID = /^rec[A-Za-z0-9]{4,32}$/;
+
+/**
+ * 读一个表配置：可以是浏览器地址栏里多维表格的链接（…/base/<app_token>?table=<table_id>&view=…），
+ * 也可以是 "<app_token>/<table_id>"。空的返回 null。
+ */
+function envTable(key: string): TableRef | null {
+  const v = (process.env[key] ?? '').trim();
+  if (!v) return null;
+  let ref: TableRef;
+  if (/^https?:\/\//.test(v)) {
+    let u: URL;
+    try {
+      u = new URL(v);
+    } catch {
+      throw new Error(`sso: ${key} is not a valid URL`);
+    }
+    if (u.pathname.includes('/wiki/')) throw new Error(`sso: ${key} is a wiki link; open the base itself (not through the wiki) and paste that link, it looks like https://xxx.feishu.cn/base/<app_token>?table=<table_id>`);
+    const parts = u.pathname.replace(/^\/+|\/+$/g, '').split('/');
+    if (parts.length !== 2 || parts[0] !== 'base') throw new Error(`sso: ${key} must look like https://xxx.feishu.cn/base/<app_token>?table=<table_id>`);
+    ref = { app: parts[1], table: u.searchParams.get('table') ?? '' };
+  } else {
+    const [app, table = ''] = v.split(/\/(.*)/s);
+    ref = { app, table };
+  }
+  if (!/^[A-Za-z0-9]{8,64}$/.test(ref.app) || !/^tbl[A-Za-z0-9]{4,32}$/.test(ref.table)) throw new Error(`sso: ${key} must be a base link with ?table=tbl… or <app_token>/<table_id>`);
+  return ref;
 }
 
 /** 只接受本站路径，登录相关页面不算，和前端 safeNext 同一规则 */
@@ -857,6 +1724,9 @@ export class FileStore implements Store {
     this.commit(() => (this.data.sessions[idHash] = s));
     return s;
   }
+  async accountSessions() {
+    return Object.values(this.data.sessions).filter((s) => s.account).map((s) => ({ ...s }));
+  }
   async deleteSessionsBySub(subs: Record<string, BlockEntry>) {
     const gone = Object.values(this.data.sessions).filter((s) => subs[s.identity.sub] && !s.account);
     if (!gone.length) return [];
@@ -879,131 +1749,382 @@ export class FileStore implements Store {
   }
 }
 
-// ---------- 集成平台账号表 ----------
+// ---------- 飞书多维表格 ----------
 
-interface RemoteAccount {
-  username: string;
-  name: string;
-  passwordHash: string;
-  /** null 是不过期 */
-  expiresAt: number | null;
+interface BitableRecord {
+  record_id: string;
+  fields: Record<string, unknown>;
 }
 
-const usable = (a: RemoteAccount) => a.expiresAt === null || Date.now() < a.expiresAt;
+interface TableField {
+  field_name: string;
+  type: number;
+}
+
+class FeishuError extends Error {}
+/** 1254043 RecordIdNotFound：那一行被删了 */
+class RecordNotFoundError extends Error {}
+
+/** 用自建应用（tenant_access_token）读写多维表格。应用要开多维表格权限，并被加为这个多维表格的「可编辑」协作者 */
+class Bitable {
+  private token = '';
+  private tokenExp = 0;
+  private pendingToken: Promise<string> | null = null;
+  private api: string;
+  private appId: string;
+  private appSecret: string;
+
+  constructor(api: string, appId: string, appSecret: string) {
+    this.api = api;
+    this.appId = appId;
+    this.appSecret = appSecret;
+  }
+
+  private async request(method: string, path: string, token: string, body?: unknown): Promise<Record<string, unknown>> {
+    const res = await fetch(this.api + path, {
+      method,
+      headers: { 'Content-Type': 'application/json; charset=utf-8', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(FEISHU_TIMEOUT_MS),
+    });
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new FeishuError(`feishu HTTP ${res.status}, body not JSON`);
+    }
+  }
+
+  /** 同一时刻只换一次 token，提前 5 分钟换新的 */
+  private accessToken(): Promise<string> {
+    if (this.token && Date.now() < this.tokenExp) return Promise.resolve(this.token);
+    this.pendingToken ??= (async () => {
+      try {
+        const out = await this.request('POST', '/open-apis/auth/v3/tenant_access_token/internal', '', { app_id: this.appId, app_secret: this.appSecret });
+        if (out.code !== 0 || typeof out.tenant_access_token !== 'string' || !out.tenant_access_token) throw new FeishuError(`feishu tenant_access_token code ${out.code} ${out.msg}`);
+        this.token = out.tenant_access_token;
+        this.tokenExp = Date.now() + Number(out.expire) * 1000 - 5 * MINUTE;
+        return this.token;
+      } finally {
+        this.pendingToken = null;
+      }
+    })();
+    return this.pendingToken;
+  }
+
+  /** 调一个多维表格接口，code 不是 0 算错；token 失效换一次再试 */
+  private async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      const out = await this.request(method, path, await this.accessToken(), body);
+      if (typeof out.code !== 'number') throw new FeishuError('feishu response without code');
+      if ([99991663, 99991661, 99991668].includes(out.code) && attempt === 0) {
+        this.token = '';
+        continue;
+      }
+      if (out.code === 1254043) throw new RecordNotFoundError('record not found');
+      if (out.code !== 0) throw new FeishuError(`feishu code ${out.code} ${out.msg}`);
+      return (out.data ?? {}) as T;
+    }
+  }
+
+  private path(t: TableRef, suffix: string) {
+    return `/open-apis/bitable/v1/apps/${encodeURIComponent(t.app)}/tables/${encodeURIComponent(t.table)}${suffix}`;
+  }
+
+  /** 翻页取完（最多 maxPages 页，每页 500 行）；filter、sort 为 null 是整表、不排序 */
+  async search(t: TableRef, filter: unknown, sort: unknown, maxPages: number): Promise<BitableRecord[]> {
+    const all: BitableRecord[] = [];
+    let pageToken = '';
+    for (let page = 0; page < maxPages; page++) {
+      const data = await this.searchCall(t, filter, sort, 500, pageToken);
+      all.push(...(data.items ?? []));
+      if (!data.has_more || !data.page_token) return all;
+      pageToken = data.page_token;
+    }
+    throw new FeishuError(`feishu search: more than ${maxPages} pages`);
+  }
+
+  /** 只取第一页 */
+  async searchPage(t: TableRef, filter: unknown, sort: unknown, size: number): Promise<BitableRecord[]> {
+    return (await this.searchCall(t, filter, sort, size, '')).items ?? [];
+  }
+
+  /** 用 page_size=1 的查询读总行数 */
+  async count(t: TableRef, filter: unknown): Promise<number> {
+    return Number((await this.searchCall(t, filter, null, 1, '')).total ?? 0);
+  }
+
+  private searchCall(t: TableRef, filter: unknown, sort: unknown, size: number, pageToken: string) {
+    const q = new URLSearchParams({ page_size: String(size), ...(pageToken ? { page_token: pageToken } : {}) });
+    const body: Record<string, unknown> = {};
+    if (filter) body.filter = filter;
+    if (sort) body.sort = sort;
+    return this.call<{ items?: BitableRecord[]; has_more?: boolean; page_token?: string; total?: number }>('POST', this.path(t, `/records/search?${q}`), body);
+  }
+
+  async batchDelete(t: TableRef, ids: string[]) {
+    await this.call('POST', this.path(t, '/records/batch_delete'), { records: ids });
+  }
+
+  /** 行不在返回 null */
+  async get(t: TableRef, recordId: string): Promise<BitableRecord | null> {
+    try {
+      return (await this.call<{ record: BitableRecord }>('GET', this.path(t, `/records/${encodeURIComponent(recordId)}`))).record;
+    } catch (e) {
+      if (e instanceof RecordNotFoundError) return null;
+      throw e;
+    }
+  }
+
+  async batchUpdate(t: TableRef, records: BitableRecord[]) {
+    await this.call('POST', this.path(t, '/records/batch_update'), { records });
+  }
+
+  async batchCreate(t: TableRef, rows: Record<string, unknown>[]) {
+    await this.call('POST', this.path(t, '/records/batch_create'), { records: rows.map((fields) => ({ fields })) });
+  }
+
+  async fields(t: TableRef): Promise<TableField[]> {
+    const all: TableField[] = [];
+    let pageToken = '';
+    for (let page = 0; page < 20; page++) {
+      const q = new URLSearchParams({ page_size: '100', ...(pageToken ? { page_token: pageToken } : {}) });
+      const data = await this.call<{ items?: TableField[]; has_more?: boolean; page_token?: string }>('GET', this.path(t, `/fields?${q}`));
+      all.push(...(data.items ?? []));
+      if (!data.has_more || !data.page_token) return all;
+      pageToken = data.page_token;
+    }
+    throw new FeishuError('feishu fields: too many pages');
+  }
+}
+
+// ---------- 待写队列 ----------
+
+interface OutboxItem {
+  id: number;
+  /** "log"：日志表新增一行；"accounts"：账号表更新 recordId 那一行 */
+  target: Target;
+  recordId?: string;
+  /** 请求日志的合并键：还没写出去的一样的请求合成一行 */
+  merge?: string;
+  fields: Record<string, unknown>;
+  at: number;
+}
 
 /**
- * 从集成平台工作流读账号（管理员在飞书多维表格里维护）：
- *   POST SSO_ACCOUNTS_URL  {"system": "<本项目的源，如 https://tools.fbif.com>"}
- *   → {"complete": true, "accounts": [{"username": "vendor-a", "name": "某供应商 张三", "password_hash": "hmac-sha256$<盐>$<hex>", "expires_at": "2026-12-31T16:00:00.000Z" 或 null}]}
- * 工作流只给本项目能用、没停用的账号；到期由这里每次登录、核对时当场判。
- * 内存里只留一份快照，过了 maxAgeMs 再用就先重拉（同一时刻只拉一次）；拉不到时用上一份，前提是它在 15 分钟内拉成功过。
- * 不落盘：集成平台挂了飞书登录也一起挂，存一份到盘上没多大用。
+ * 写日志表、写回账号表的持久队列：每次去写之前先 fsync 落盘，写成了才删；重启接着写。
+ * 登录和请求从不等它（落盘也在后台），写不进去只在健康检查里报。同一行的写回合并成一条（后写的值为准），
+ * 还没写出去的一样的请求日志合成一行（次数加一、耗时取最大）。
  */
-function remoteAccounts(url: string, system: string, maxAgeMs: number): Accounts {
-  let byName = new Map<string, RemoteAccount>();
-  let fetchedAt = 0; // 最近一次拉成功
-  let triedAt = 0; // 最近一次拉完（成功或失败）；失败后 maxAgeMs 内不再拉，别让每个请求都等一次超时
-  let lastErr = '';
-  let inflight: Promise<void> | null = null;
+class Outbox {
+  private seq = 0;
+  private items: OutboxItem[] = [];
+  private inflight = new Set<number>();
+  private wakers = new Map<Target, (() => void) | null>();
+  private pendingWake = new Set<Target>();
+  /** 在退避里等着的写入，兜底对账叫醒它 */
+  private kicks = new Map<Target, () => void>();
+  private saveFailed = false;
+  private saveQueued = false;
+  private path: string;
+  /** 最近一分钟新增的请求日志行 */
+  private requestTimes: number[] = [];
+  private dropping = false;
+  private dropped = 0;
+  private droppedAt = 0;
 
-  const fetchAccounts = async () => {
-    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ system }), signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
-    const text = await readLimited(res, 1 << 20);
-    if (res.status !== 200) throw new Error(`accounts HTTP ${res.status}`);
-    let got: { complete?: unknown; accounts?: unknown };
+  constructor(path: string, targets: Target[]) {
+    this.path = path;
+    for (const t of targets) this.wakers.set(t, null);
+    let raw = '';
     try {
-      got = JSON.parse(text);
-    } catch {
-      throw new Error(`accounts malformed: ${text.slice(0, 200)}`);
+      raw = readFileSync(path, 'utf8');
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`sso: SSO_OUTBOX_FILE: ${describe(e)}`);
     }
-    if (typeof got.complete !== 'boolean' || !Array.isArray(got.accounts)) throw new Error(`accounts malformed: ${text.slice(0, 200)}`);
-    if (!got.complete) throw new Error('accounts incomplete, keeping the old ones');
-    const next = new Map<string, RemoteAccount>();
-    for (const a of got.accounts as { username?: unknown; name?: unknown; password_hash?: unknown; expires_at?: unknown }[]) {
-      const name = (typeof a.username === 'string' ? a.username : '').trim().toLowerCase();
-      if (!name || next.has(name)) continue;
-      let expiresAt: number | null = null;
-      if (a.expires_at !== null && a.expires_at !== undefined) {
-        expiresAt = typeof a.expires_at === 'string' ? Date.parse(a.expires_at) : NaN;
-        if (Number.isNaN(expiresAt)) {
-          console.log(`sso: account ${name} has bad expires_at ${JSON.stringify(a.expires_at)}, skipped`);
+    if (raw) {
+      let saved: OutboxItem[] = [];
+      try {
+        saved = JSON.parse(raw);
+      } catch {
+        // 文件坏了也不能挡登录：挪到一边留着查，从空队列开始。
+        const aside = `${path}.corrupt-${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)}`;
+        renameSync(path, aside);
+        console.error(`sso: outbox file unreadable, moved to ${aside}`);
+      }
+      let dropped = 0;
+      for (const it of saved) {
+        if (!this.wakers.has(it.target)) {
+          dropped++;
           continue;
         }
+        this.items.push(it);
+        this.seq = Math.max(this.seq, it.id);
       }
-      next.set(name, { username: name, name: typeof a.name === 'string' ? a.name : '', passwordHash: typeof a.password_hash === 'string' ? a.password_hash : '', expiresAt });
+      if (dropped) console.error(`sso: outbox dropped ${dropped} entries for a table that is no longer configured`);
     }
-    return next;
-  };
-
-  // 返回能用的快照：过了 maxAgeMs 先重拉，并发的调用方等同一次拉取。
-  const current = async () => {
-    if (!inflight && Date.now() - triedAt >= maxAgeMs) {
-      inflight = fetchAccounts().then(
-        (next) => {
-          byName = next;
-          fetchedAt = triedAt = Date.now();
-        },
-        (e) => {
-          console.log(`sso: accounts fetch: ${describe(e)}`);
-          lastErr = describe(e);
-          triedAt = Date.now();
-        },
-      );
-      inflight.finally(() => (inflight = null));
+    try {
+      this.save();
+    } catch (e) {
+      throw new Error(`sso: SSO_OUTBOX_FILE: ${describe(e)}`);
     }
-    if (inflight) await inflight;
-    if (!fetchedAt || Date.now() - fetchedAt > OUTAGE_GRACE_MS) throw new Error(`sso: accounts unavailable: ${lastErr}`);
-    return byName;
-  };
-
-  return {
-    async verify(username, password) {
-      const a = (await current()).get(username);
-      // 没这个账号也照样算一遍哈希，回得一样，探不出哪些账号存在。
-      const ok = checkPassword(a?.passwordHash ?? DUMMY_PASSWORD_HASH, password);
-      if (!a || !ok || !usable(a)) throw new AuthFailedError();
-      return { username: a.username, name: a.name, credential: credentialOf(a.passwordHash) };
-    },
-    async active(username, credential) {
-      const a = (await current()).get(username);
-      return !!a && usable(a) && credentialOf(a.passwordHash) === credential;
-    },
-  };
-}
-
-/** 最多读 limit 字节，超了算失败 */
-async function readLimited(res: Response, limit: number): Promise<string> {
-  const reader = res.body?.getReader();
-  const chunks: Uint8Array[] = [];
-  let n = 0;
-  while (reader) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    n += value.length;
-    if (n > limit) {
-      await reader.cancel();
-      throw new Error(`response over ${limit} bytes`);
-    }
-    chunks.push(value);
+    for (const t of targets) this.pendingWake.add(t); // 重启前没写完的接着写
   }
-  return Buffer.concat(chunks).toString('utf8');
-}
 
-/** 存进会话的密码指纹：哈希变了（重置密码）指纹就变，又不把哈希本身存进会话 */
-const credentialOf = (passwordHash: string) => createHash('sha256').update(passwordHash).digest('hex').slice(0, 16);
+  targets(): Target[] {
+    return [...this.wakers.keys()].sort();
+  }
 
-/** 谁也对不上的哈希，只用来让「没这个账号」和「密码错」走一样的路 */
-const DUMMY_PASSWORD_HASH = 'hmac-sha256$sso-dummy-salt$0000000000000000000000000000000000000000000000000000000000000000';
+  add(it: { target: Target; recordId?: string; merge?: string; fields: Record<string, unknown> }) {
+    if (!this.mergeInto(it)) {
+      if (it.merge && !this.allowRequestRow()) return;
+      this.items.push({ id: ++this.seq, target: it.target, recordId: it.recordId, merge: it.merge, fields: { ...it.fields }, at: Date.now() });
+      this.trimLogs();
+    }
+    this.queueSave();
+    this.wake(it.target);
+  }
 
-const PASSWORD_HASH_FORMAT = /^hmac-sha256\$([A-Za-z0-9_-]{8,64})\$([0-9a-f]{64})$/;
+  /** 并进队列里还没写出去的同一条：账号表同一行后写的值为准；一样的请求日志次数加一、耗时取最大，时间留第一次的 */
+  private mergeInto(it: { target: Target; recordId?: string; merge?: string; fields: Record<string, unknown> }) {
+    for (const e of this.items) {
+      if (this.inflight.has(e.id) || e.target !== it.target) continue;
+      if (it.target === 'accounts' && e.recordId === it.recordId) {
+        Object.assign(e.fields, it.fields);
+        return true;
+      }
+      if (it.merge && e.merge === it.merge) {
+        e.fields.次数 = Number(e.fields.次数 ?? 1) + 1;
+        e.fields.耗时毫秒 = Math.max(Number(e.fields.耗时毫秒 ?? 0), Number(it.fields.耗时毫秒 ?? 0));
+        return true;
+      }
+    }
+    return false;
+  }
 
-/**
- * 校验 hmac-sha256$<盐>$<hex>：hex 是以盐为密钥对密码做 HMAC-SHA256；别的格式一律不认。
- * 密码由系统生成（≥120 位随机），快速的带盐哈希就够了；慢哈希只对人自己起的密码有用。
- */
-function checkPassword(encoded: string, password: string): boolean {
-  const m = PASSWORD_HASH_FORMAT.exec(encoded);
-  if (!m) return false;
-  const got = createHmac('sha256', m[1]).update(password, 'utf8').digest('hex');
-  return timingSafeEqual(Buffer.from(got), Buffer.from(m[2]));
+  /** 最近一分钟新增的请求日志行到了 200 就丢，开始丢时记一行 stderr，健康检查里看得到丢了多少 */
+  private allowRequestRow() {
+    const now = Date.now();
+    this.requestTimes = this.requestTimes.filter((t) => now - t <= MINUTE);
+    if (this.requestTimes.length < REQUEST_ROWS_PER_MINUTE) {
+      this.requestTimes.push(now);
+      this.dropping = false;
+      return true;
+    }
+    if (!this.dropping) console.error(`sso: more than ${REQUEST_ROWS_PER_MINUTE} request log rows in a minute, dropping the rest`);
+    this.dropping = true;
+    this.dropped++;
+    this.droppedAt = now;
+    return false;
+  }
+
+  /** 日志超过上限时丢最旧的（正在写的不丢），并记 stderr */
+  private trimLogs() {
+    let drop = this.items.filter((it) => it.target === 'log').length - OUTBOX_MAX_LOGS;
+    if (drop <= 0) return;
+    const before = this.items.length;
+    this.items = this.items.filter((it) => !(drop > 0 && it.target === 'log' && !this.inflight.has(it.id) && drop-- > 0));
+    console.error(`sso: outbox over ${OUTBOX_MAX_LOGS} log rows, dropped the ${before - this.items.length} oldest`);
+  }
+
+  private wake(target: Target) {
+    const w = this.wakers.get(target);
+    if (w) {
+      this.wakers.set(target, null);
+      w();
+    } else this.pendingWake.add(target);
+  }
+
+  /** 有改动就在后台落盘，登录和请求不用等 fsync */
+  private queueSave() {
+    if (this.saveQueued) return;
+    this.saveQueued = true;
+    setImmediate(() => {
+      this.saveQueued = false;
+      this.saveLogged();
+    });
+  }
+
+  /** 落盘，只在刚开始失败时记一行 stderr */
+  private saveLogged() {
+    const failedBefore = this.saveFailed;
+    try {
+      this.save();
+    } catch (e) {
+      if (!failedBefore) console.error(`sso: outbox write failed (kept in memory): ${describe(e)}`);
+    }
+  }
+
+  private save() {
+    const tmp = this.path + '.tmp';
+    try {
+      const fd = openSync(tmp, 'w', 0o600);
+      try {
+        writeSync(fd, JSON.stringify(this.items));
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, this.path);
+      this.saveFailed = false;
+    } catch (e) {
+      this.saveFailed = true;
+      throw e;
+    }
+  }
+
+  /** 取一批（最多 500 条）去写，取之前先落盘：写出去之前一定已经在盘上 */
+  take(target: Target): OutboxItem[] {
+    const batch: OutboxItem[] = [];
+    for (const it of this.items) {
+      if (it.target !== target || this.inflight.has(it.id)) continue;
+      this.inflight.add(it.id);
+      batch.push({ ...it, fields: { ...it.fields } });
+      if (batch.length === OUTBOX_BATCH) break;
+    }
+    if (batch.length) this.saveLogged();
+    return batch;
+  }
+
+  /** 写失败后的退避：时间到，或兜底对账发现还有积压（kickBacklog），就返回 */
+  pause(target: Target, ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.kicks.delete(target);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      this.kicks.set(target, done);
+    });
+  }
+
+  /** 还有积压的写入不等退避、马上再写一次（兜底对账每轮调一次） */
+  kickBacklog() {
+    for (const t of new Set(this.items.map((it) => it.target))) this.kicks.get(t)?.();
+  }
+
+  /** 等到这张表有东西进来；之前就有没取走的提醒立即返回 */
+  waitFor(target: Target): Promise<void> {
+    if (this.pendingWake.delete(target)) return Promise.resolve();
+    return new Promise((r) => this.wakers.set(target, r));
+  }
+
+  finish(batch: OutboxItem[], delivered: boolean) {
+    const done = new Set(batch.map((it) => it.id));
+    for (const id of done) this.inflight.delete(id);
+    if (!delivered) return;
+    this.items = this.items.filter((it) => !done.has(it.id));
+    this.saveLogged();
+  }
+
+  stats() {
+    return {
+      pending: this.items.length,
+      oldest: this.items.reduce((m, it) => (m === 0 || it.at < m ? it.at : m), 0),
+      saveFailed: this.saveFailed,
+      dropped: this.dropped,
+      droppedAt: this.droppedAt,
+    };
+  }
 }

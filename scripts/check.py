@@ -15,7 +15,7 @@ SECRET_PATTERNS = {
     "github token": re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}"),
     "api key": re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}"),
     "private key": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    "public ipv4": re.compile(r"\b(?!(?:10|127|0)\.)(?!192\.168\.)(?!172\.(?:1[6-9]|2\d|3[01])\.)(?:\d{1,3}\.){3}\d{1,3}\b"),
+    "public ipv4": re.compile(r"\b(?!(?:10|127|0)\.)(?!192\.168\.)(?!172\.(?:1[6-9]|2\d|3[01])\.)(?!192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)(?:\d{1,3}\.){3}\d{1,3}\b"),
 }
 IP_ALLOWED_FILES = {"platform-anycross-public-ips.md", "updates-ip.md"}
 FORBIDDEN_PATHS = ["assets/secrets", "learnings.jsonl", ".env"]

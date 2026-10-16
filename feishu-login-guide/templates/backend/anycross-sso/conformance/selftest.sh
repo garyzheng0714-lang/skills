@@ -30,6 +30,6 @@ for lang in $langs; do
       start="node --experimental-strip-types --no-warnings $work/server.ts"
       ;;
   esac
-  node "$here/run.mjs" --start "$start" --cwd "$work" --protected /api/me,/api/export --fresh /api/sensitive --report "$here/selftest-$lang.json" || status=1
+  node "$here/run.mjs" --start "$start" --cwd "$work" --protected /api/me,/api/export --fresh /api/sensitive --feature export=导出 --feature-route /api/export-sheet --audit-route /api/download --error-route /api/boom --report "$here/selftest-$lang.json" || status=1
 done
 exit $status

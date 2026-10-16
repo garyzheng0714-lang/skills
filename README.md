@@ -52,3 +52,9 @@ git -C ~/garyzheng-skills pull
 ```bash
 python3 scripts/check.py
 ```
+
+`feishu-login-guide` 以本机 `~/.claude/skills/feishu-login-guide` 为准。同步用下面这条，它会排除密钥文件夹和内部记录，并给服务器 IP 这类信息打码。同步完再跑上面的检查，并在 `feishu-login-guide/templates/backend/anycross-sso` 里跑 `bash conformance/selftest.sh`，两个模板都要全部通过：
+
+```bash
+python3 scripts/sync-feishu-login-guide.py
+```
