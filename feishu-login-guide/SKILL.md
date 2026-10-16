@@ -27,7 +27,8 @@ allowed-tools:
 
 - 每个项目在集成平台「身份集成 → 单点登录 → 应用管理」建自己的 SSO 应用（OIDC），各有 App ID 和密钥；谁能进在那个应用的「可访问成员 / 禁止访问成员」里配；富的靠「关联组织访问控制」。不再在飞书开发者后台给每个项目建登录 App。
 - 离职、冻结、紧急下线由集成平台「统一登录」项目的工作流管：名单一变就提醒各项目，项目自己来拉停用名单并踢人（实测 1 秒内生效，最坏 2 小时由对账补上）。新项目只需在该项目配置「接入项目通知地址」加一行。
-- 模板（Go、Node）把 7 件必做的事都写好了（第 7 件是账号密码登录）；合规测试 `conformance/run.mjs` 用假的集成平台检查，**全过才能上线**，结果存档（有 HR、盖章这类敏感接口带 `--fresh` 共 61 项，没有就 60 项）。
+- 模板（Go、Node）把 7 件必做的事都写好了（第 7 件是账号密码登录）；合规测试 `conformance/run.mjs` 用假的集成平台检查，**全过才能上线**，结果存档（有 HR、盖章这类敏感接口带 `--fresh` 共 68 项，没有就 67 项）。
+- 接入时两处容易漏：进程退出前调 `sso.Shutdown(ctx)`（Node：`await sso.shutdown()`）把待写队列落盘；访客 IP 只认反向代理加在 `X-Forwarded-For` 最右边的那个（Caddy 默认的 `reverse_proxy` 就对，nginx 要 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`），`X-Real-IP` 能伪造、不认。
 - 前端：`FeishuSignIn.tsx.template` v8（所有项目一样：飞书按钮 + 账号密码表单）+ `session.ts.template` 原样复制，飞书路由路径与 v4 相同。账号密码登录模板已带（2026-10-16 用户裁定「所有项目都带」），给没有飞书的外部供应商、兼职用；账号放在「总账本」多维表格里每个项目自己的「项目名｜账号」表（管理员加人、停用、改密码、勾功能；读写用「飞书云文档编辑助手」应用），项目服务器经飞书开放平台接口当场查表；登录、退出、被收回和该记的请求写进总账本共用的「日志」表（`SSO_ACCOUNTS_TABLE`、`SSO_LOG_TABLE`、`SSO_LOG_PROJECT_RECORD`，约定见模板 README「账号密码」）。**事件优先，进程内定时兜底**：改了账号表由表里的自动化（`scripts/account-hooks.mjs` 生成，接入时建一次）当场生效；事件丢了由项目进程里的兜底对账循环收回（启动先跑一轮，之后默认每 6 小时一轮，`SSO_RECONCILE_INTERVAL` 可调，10 分钟～24 小时），不用集成平台或多维表格的定时触发器。集成平台只管飞书登录和停用名单。没配账号表时表单照样在、登录回「账号或密码错误」。
 - **路线 A 只管登录。** 登录后还要以用户身份调飞书开放平台 API 的项目（排版工具、速记：云文档、群列表等），飞书用户授权仍按 v4 的 App 授权 + `references/session-and-token-renewal.md` 的后台保活做，和登录分开。
 - 集成平台各工作流的网址触发器地址**不写进本 skill、项目代码和 Git**：要用时到集成平台「统一登录」项目里取，只放服务器环境文件。
@@ -672,7 +673,7 @@ AI 给用户的指令在 Step 5 待办【2】【3】里。
 ## 最小完成标准
 
 **路线 A（v5 默认）**：只有同时满足这些，才能说接入完成——
-- 合规测试 `conformance/run.mjs` 全部通过（`--protected` 列全所有受保护接口，含下载、导出、长连接；有敏感接口时带 `--fresh`，共 61 项；没有敏感接口不带，共 60 项；项目声明了 `Features` 的带 `--feature <key>=<列名>` 和 `--feature-route`——「敏感接口当场核对」这一项只在带 `--fresh` 时跑），结果 JSON 存进项目 `docs/`。
+- 合规测试 `conformance/run.mjs` 全部通过（`--protected` 列全所有受保护接口，含下载、导出、长连接；有敏感接口时带 `--fresh`，共 68 项；没有敏感接口不带，共 67 项；项目声明了 `Features` 的带 `--feature <key>=<列名>` 和 `--feature-route`——「敏感接口当场核对」这一项只在带 `--fresh` 时跑），结果 JSON 存进项目 `docs/`。
 - 集成平台 SSO 应用的回调地址、offline_access、可访问成员、富的关联组织访问控制已配好；App Secret 在密钥仓库。
 - 「统一登录」项目「接入项目通知地址」已加这一行；项目服务器的出口 IP 在停用名单读取的白名单里；服务器日志有启动时的 `sso: blocklist revision …`，手动跑一次「定时对账」后再出现一次。
 - 线上用户在飞书里打开一次零点击进入，`/api/me` 返回本人；旧的 v4 登录入口已下线（不并存）。
@@ -741,8 +742,8 @@ templates/
       go/sso.go.template                     ← Go net/http 实现（go-oidc + oauth2）
       node/sso.ts.template                   ← Node/TS 实现（openid-client@6，Express 或原生 http）
       conformance/run.mjs + fake-idp.mjs     ← 合规测试（假集成平台，任何语言通用）
-      conformance/selftest.sh                ← 改模板后跑：两个模板各 61 项
-      conformance/mutants.mjs                ← 改测试后跑：56 个故意改坏的版本都要被抓到
+      conformance/selftest.sh                ← 改模板后跑：两个模板各 68 项
+      conformance/mutants.mjs                ← 改测试后跑：70 个故意改坏的版本都要被抓到
       scripts/account-hooks.mjs              ← 生成账号表的两条自动化（接入时跑一次，Features 改了再跑）
     go-net-http/feishu_oauth.go.template     ← v4：FBIF + 富的 共 8 条路由
     go-gin/feishu_oauth.go.template          ← 同上

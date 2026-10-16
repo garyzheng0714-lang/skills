@@ -12,7 +12,7 @@
 | `node/sso.ts.template` | Node/TypeScript 实现（Express 或原生 http），放到 `src/auth/sso.ts` |
 | `conformance/run.mjs` | 合规测试：起一个假的集成平台，任何语言的项目都用它验收 |
 | `conformance/selftest.sh` | 改了模板后跑：把两个模板装进最小项目各跑一遍合规测试 |
-| `conformance/mutants.mjs` | 改了合规测试后跑：把 Go 模板故意改坏 56 处，每处都必须被抓到 |
+| `conformance/mutants.mjs` | 改了合规测试后跑：把 Go 模板故意改坏 70 处，每处都必须被抓到 |
 | `scripts/account-hooks.mjs` | 生成账号表的两条自动化（改了账号表就提醒项目），接入时跑一次 |
 
 其他语言（Python、Rust）照 Go 模板逐条翻译，验收标准一样：合规测试全过。
@@ -27,7 +27,7 @@
 | 4 | 用着的会话每 5 分钟用 refresh_token 换一次 access_token 并调用户信息：403 立即下线并撤销 refresh_token；refresh_token 被拒（任何 4xx，不管响应体是不是 JSON）也下线；用户信息 401 先看是不是别的实例刚刷新过（以库里为准），不直接踢人；集成平台超时或 5xx 普通接口最多再放行 15 分钟，期间每个会话 30 秒才重试一次，放行前重读会话，敏感接口不放行。没人用就不查 | `check` / `authenticate` | 用户信息 403、refresh_token 被拒、故障宽限、敏感接口 |
 | 5 | 名单提醒接口 `POST /internal/auth/blocklist-changed`，收 `{"revision": N}`，立即回 202；N 比本地新或为 0 才去拉整份停用名单，一个实例每 30 秒最多拉一次（每次拉都算集成平台一次工作流运行）；名单 `complete` 不是 true 就保留旧名单；版本号比库里小的名单不写（多实例乱序）；先落库再踢人：作废名单里的人在本项目的全部会话（所有实例）、撤销他们的 refresh_token、之后再登录也拒绝；每个请求也查一次名单；**名单从没同步成功过就拒绝所有登录**；启动时和每轮兜底对账（默认 6 小时）各拉一次 | `handleBlocklistChanged` / `syncBlocklist` / `blocked` | 名单没同步过、假提醒、名单加人、重复/旧提醒、revision 0、没读全、恢复、重启后仍拒绝、旧名单不盖新名单 |
 | 6 | 刷新加锁（同一会话同一时刻只刷新一个），写回按版本号比对；刷新和停用同时发生时停用优先，晚到的刷新结果不能把会话救回来（会话已没了就撤销晚到的新令牌）。同一个回调并发到达只换一次码。退出只退这个项目在这个浏览器里的会话（撤销本会话的 refresh_token；存储删不掉就报退出失败），飞书本身、同一人的其他浏览器、其他项目都不受影响；退出只接受 POST | `check` / `handleLogout` / `consumeState` | 退出两条（拿旧 cookie 重放） |
-| 7 | 账号密码登录（2026-10-16 用户裁定「所有项目都带」：登录页各项目一样，都有账号密码表单）：给没有飞书的外部供应商、兼职用。`POST /auth/account/login` 只收 JSON `{username, password}`，当场查本项目的飞书多维表格账号表；对了 200 `{ok:true}` 并下发同一个会话 cookie，账号不存在、重复、缺密码、密码错、账号状态不是「启用」一律 401 `auth_failed`、回得一样；同一账号 15 分钟内连错 5 次回 429 `rate_limited` 并在表里写回「已锁定」；表查不了 503。账号会话 company_code 是 `account`，sub 是表里那一行的记录 ID，同样过 `OnLogin`；不找集成平台核对、不归停用名单管，改为每个核对周期按记录 ID 读一次那一行，删了、停用、改了密码就下线；敏感接口（`RequireFreshUser`）一律 403 `sso_required`。按人开关的功能用复选框列（`Features`）。事件优先：人改了账号表由表里的自动化 `POST /internal/auth/accounts-changed` 当场收回；事件丢了由进程内的兜底对账（默认 6 小时一轮）收回。每次登录、失败、退出、被收回和该记的请求写进总账本共用的「日志」表（持久待写队列，不挡登录），健康检查 `GET /internal/auth/health`。项目没配账号表时表单照样在，登录一律 401 | `handleAccountLogin` / `checkAccount` / `handleAccountsChanged` / `reconcileLoop` / `Middleware` / `outbox` | 从「账号密码登录：当场查账号表」起往后各条 |
+| 7 | 账号密码登录（2026-10-16 用户裁定「所有项目都带」：登录页各项目一样，都有账号密码表单）：给没有飞书的外部供应商、兼职用。`POST /auth/account/login` 只收 JSON `{username, password}`，当场查本项目的飞书多维表格账号表；对了 200 `{ok:true}` 并下发同一个会话 cookie，账号不存在、重复、缺密码、密码错、账号状态不是「启用」一律 401 `auth_failed`、回得一样；同一账号 15 分钟内连错 5 次（同时猜也凑不出第 6 次）回 429 `rate_limited` 并在表里写回「已锁定」；每个 IP 每分钟最多 10 次、整个进程每分钟最多查 60 次表，超了 429；表查不了、账号表的列有问题 503。账号会话 company_code 是 `account`，sub 是表里那一行的记录 ID，同样过 `OnLogin`；不找集成平台核对、不归停用名单管，改为每个核对周期按记录 ID 读一次那一行，删了、停用、改了密码就下线；敏感接口（`RequireFreshUser`）一律 403 `sso_required`。按人开关的功能用复选框列（`Features`）。事件优先：人改了账号表由表里的自动化 `POST /internal/auth/accounts-changed` 当场收回；事件丢了由进程内的兜底对账（默认 6 小时一轮）收回。每次登录、失败、退出、被收回和该记的请求写进总账本共用的「日志」表（持久待写队列，不挡登录），健康检查 `GET /internal/auth/health`。项目没配账号表时表单照样在，登录一律 401 | `handleAccountLogin` / `checkAccount` / `handleAccountsChanged` / `reconcileLoop` / `Middleware` / `outbox` | 从「账号密码登录：当场查账号表」起往后各条 |
 
 ## 路由（与现有登录页同路径，前端不用改）
 
@@ -62,7 +62,11 @@
      sso.Register(mux)
      mux.Handle("GET /api/export", sso.RequireUser(exportHandler)) // 导出、下载在 handler 里调 auth.Audit(r)，成功的也记一行
      mux.Handle("POST /api/hr/salary", sso.RequireFreshUser(salaryHandler))
-     http.ListenAndServe(addr, sso.Middleware(mux)) // 请求日志：包住整个 mux
+     srv := &http.Server{Addr: addr, Handler: sso.Middleware(mux)} // 请求日志：包住整个 mux
+     go srv.ListenAndServe()
+     <-ctx.Done()                 // ctx 来自 signal.NotifyContext(…, SIGINT, SIGTERM)
+     srv.Shutdown(shutdownCtx)    // 先不再收请求
+     sso.Shutdown(shutdownCtx)    // 再把待写队列落盘，重启后接着写
      ```
 
      ```ts
@@ -72,6 +76,8 @@
      app.use(express.json());
      app.get('/api/export', sso.requireUser, (req, res) => { audit(req); /* … */ });
      app.post('/api/hr/salary', sso.requireFreshUser, salaryHandler);
+     const server = app.listen(port);
+     process.once('SIGTERM', () => { server.close(); void sso.shutdown().finally(() => process.exit(0)); }); // 退出前把待写队列落盘
      ```
    - 取当前用户：Go `auth.CurrentUser(r)`；Node `req.ssoUser`。
    - 账号密码：配 `SSO_ACCOUNTS_TABLE`、`SSO_LOG_TABLE` 等（见下面「账号密码」），没有外部账号就都不配，表单在、登录一律 401。项目有按人开关的功能就在 `Options.Features`（Node：`features`）里声明。`OnLogin` 会收到 company_code 为 `account` 的身份，项目不想放外部账号进来就对它返回 `ErrNotAllowed`。
@@ -148,12 +154,18 @@
 
 请求日志（Go `sso.Middleware(mux)`，Node `app.use(sso.logRequests)`）只记这几种，每种一行「类型=请求」：401、403；改数据的请求（POST/PUT/PATCH/DELETE，不管成没成；登录、退出、两个提醒这些本模板自己的路由除外）；敏感接口（`RequireFreshUser`）；调了 `auth.Audit(r)`（Node：`audit(req)`）的导出、下载；5xx。普通成功的 GET、404 的 GET 不记。路径不带查询串；有会话就记是谁。结果 2xx/3xx 是成功，其余失败；原因 401 是「没登录」、403「没有权限」、5xx「服务出错」。
 
-- 还没写出去的一样的请求（方法、路径、状态码、同一个人，没登录按 IP）合成一行：次数累加，时间留第一次，耗时取最大。登录、退出、被收回从不合并。
-- 一个进程每分钟最多新增 200 行请求日志，多的丢掉，stderr 记一行，健康检查 `dropped_request_rows` 计数并在 15 分钟内带 `warn_request_rows_dropped`。
+不用登录就能造出来的两种行（请求、登录失败）合并、限量，防有人刷满共用的日志表（2026-10-16）：
+
+- 一样的行合成一行，「次数」累加，时间留第一次，耗时取最大。请求按方法、路径、状态码、同一个人（没登录按 IP）算一样；登录失败（不带 state 的回调、被锁的账号、密码不对等）按登录方式、IP、账号、原因算一样。登录成功、退出、被收回从不合并、每次一行。
+- 同一键 10 秒内最多新起一行：写出去后 10 秒内又来，先暂存到 10 秒满再写，期间再来的都并进这一行。所以刷 200 次一样的登录失败，日志表里是几行、次数加起来 200。
+- 一个进程每分钟最多新增 200 行请求日志、30 行登录失败日志（各算各的），多的丢掉，stderr 记一行，健康检查 `dropped_request_rows` / `dropped_login_rows` 计数，15 分钟内带 `warn_request_rows_dropped` / `warn_login_rows_dropped`（只提醒，`ok` 不变）。
+- 没在表里查到的账号（常有人把密码填进账号栏）只记开头一两个字、后面打码并写出总长，如 `ab***（12 字）`；查到了才记原文。
+
+访客 IP（「IP」「IP来源」两列）：直连的是本机或内网地址（就是前面的反向代理）时，取 `X-Forwarded-For` **最右边**那个，那是反向代理自己加上的；左边的、`X-Real-IP` 都可能是访客自己写的，不认。直连的是公网地址时这些头一概不认，用直连地址。Caddy 用默认的 `reverse_proxy` 就对（它不信访客传来的 `X-Forwarded-For`，换成真实地址），什么都不用加；nginx 要 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`。前面再有一层 CDN 时记到的是 CDN 的地址。
 
 ### 账号表的自动化（接入时跑一次）
 
-人在表里加人、停用、改密码、勾功能后，表里的自动化马上 `POST https://<项目域名>/internal/auth/accounts-changed {"record_id":"rec…"}`。项目马上回 202（不回数据，乱给的 ID 无害；同一行并发只处理一次，全局每分钟最多 60 次），然后当场读那一行：删了、账号状态不是启用、密码改了，就收回绑在这一行上的全部会话并记「被收回」；否则更新名字和功能。最后把这一行（和同名的几行）的「状态」对一遍，对不上才写回。
+人在表里加人、停用、改密码、勾功能后，表里的自动化马上 `POST https://<项目域名>/internal/auth/accounts-changed {"record_id":"rec…"}`。项目马上回 202（不回数据，乱给的 ID 无害；同一行并发只处理一次，处理期间又来了就处理完再来一遍；全局每分钟最多处理 60 次，再来的那一遍也算；顺带的表结构检查最多每分钟一次，兜底对账每轮照查），然后当场读那一行：删了、账号状态不是启用、密码改了，就收回绑在这一行上的全部会话并记「被收回」；否则更新名字和功能。最后把这一行（和同名的几行）的「状态」对一遍，对不上才写回。
 
 用生成器建两条自动化，**接入时跑一次，代码里 `Features` 改了再跑一次**（换掉「改了…」那条）：
 
@@ -175,19 +187,21 @@ node ~/.claude/skills/feishu-login-guide/templates/backend/anycross-sso/scripts/
 ### 行为
 
 - 登录：账号去空格转小写、密码去前后空白，按账号当场查表。查不到、重复、缺密码、密码不对、账号状态不是启用一律 401 `auth_failed`、回得一样，真实原因只写进日志；表查不了 503（不放人，也不算连错）。密码用定长比较。
-- 同一账号 15 分钟内连错 5 次锁住：回 429，表里写回「已锁定」和解锁时间。
+- 同一账号 15 分钟内连错 5 次锁住：回 429，表里写回「已锁定」和解锁时间。查表前先占一次名额：连错次数加上正在查的凑满 5 次就直接 429（日志原因「同时尝试太多次」），同时猜 50 次也最多真查 5 次；查不了表、被限速的那次退回名额，不算连错。锁住后再来只在那一行「已锁定」的次数上加一。
+- 限速（每次登录都要当场查一次表）：每个 IP 每分钟最多 10 次、整个进程每分钟最多查 60 次账号表，超了 429 `rate_limited`，日志原因「请求太频繁」（一样的合成一行记次数）。只在本实例内存里计数。
+- 账号表的列有问题（`accounts_column:*`：有人改了列名、类型）时读回来的空值不能当真，按「表查不了」处理：新登录 503，登着的人不收回、照宽限期放行，兜底对账这一轮不碰会话，「状态」不写。要按读出来的值收回会话（停用、改了密码）、拒绝登录（缺密码、账号状态不是启用）、改「状态」之前，先当场查一次列确认没问题。
 - 账号会话认的是表里那一行的记录 ID，改账号名不掉线；会话里只存密码指纹。读不到表时普通接口最多再放行 15 分钟。
 - 功能：飞书登录的人有全部功能，账号登录的人只有勾上的。代码里 `Features: []auth.Feature{{Key: "export", Column: "导出"}}`（Node：`features: [{ key: 'export', column: '导出' }]`），接口里 `auth.HasFeature(r, "export")`（Node：`hasFeature(req, 'export')`）判断，`/api/me` 也带 `features`。启动、每轮兜底对账、每次变更提醒和写入失败后都核对表结构：声明的列不存在或不是复选框，这个功能对所有人（含飞书登录）关掉，健康检查报 `feature_column:<key>`；表里有没声明的复选框只提醒（`warn_undeclared_checkbox:<列>`，不算故障）。
-- 写日志、写回账号表走持久的待写队列：进队列就在后台落盘（请求不等 fsync），每批写出去之前一定已在盘上，写成了才删；有东西进来马上写，写的时候新进来的攒着下一批一起写（一批最多 500 行）；失败才按 1 秒起翻倍、最长 5 分钟退避（日志表写满了也一样，登录和请求照常），重启接着写；同一行账号的写回、一样的请求在队列里合并；日志最多积 1 万条（超了丢最旧的）。登录从不等它。队列文件坏了挪到一边、从空队列开始。
+- 写日志、写回账号表走持久的待写队列：进队列只改内存，落盘在后台（拍一份快照，锁外写临时文件、fsync、改名；同一时间只有一个在写，写的时候新来的改动攒着下一次一起落），磁盘慢、卡住也不拖慢登录；每批写出去之前先等这批落过盘，写成了才删；有东西进来马上写，写的时候新进来的攒着下一批一起写（一批最多 500 行）；失败才按 1 秒起翻倍、最长 5 分钟退避（日志表写满了也一样，登录和请求照常），重启接着写；同一行账号的写回在队列里合成一条（一批里同一行只有一条，后写的值为准）；判断「状态」要不要写时把还没写成的写回叠在表里读到的值上；日志最多积 1 万条（超了丢最旧的）。登录从不等它。队列文件坏了挪到一边、从空队列开始。进程退出前调 `sso.Shutdown(ctx)`（Node：`await sso.shutdown()`）把最后的改动落盘。
 - `Store` 接口里 `AccountSessions` 返回全部账号密码会话，变更提醒和兜底对账用；自己实现 `Store` 的项目要实现它。
 
 ### 日志表只留最新的（2026-10-16 用户同意请求日志「只留最新的」）
 
-日志表每写 500 行（和日志写入启动时）用 `page_size=1` 的查询读一次总行数；超过 `SSO_LOG_MAX_ROWS`（默认 45000）就按时间从旧到新删「类型=请求」的行（每次最多 500 行），删到上限的 90%。**登录、退出、被收回的行永远不删。** 日志表是共用的，删的是全表最旧的请求行，不分项目。
+日志表每写 500 行（和日志写入启动时）用 `page_size=1` 的查询读一次总行数；超过 `SSO_LOG_MAX_ROWS`（默认 45000）就删到上限的 90%（每次最多 500 行），每一类都按时间从旧到新：先删「登录失败」（不用登录就能造出来），不够再删「请求」，还不够才删别的（登录成功、退出、被收回）。所以表永远不会被删不掉的行塞满、写不进去，也不用人去清。日志表是共用的，删的是全表最旧的，不分项目。
 
 ### 健康检查
 
-`GET /internal/auth/health`：`{ok, outbox_pending, oldest_pending_seconds, dropped_request_rows, problems}`，有问题回 503，不带个人信息、表 ID、错误原文。问题码：`accounts_column:<列>`、`log_column:<列>`、`feature_column:<key>`、`accounts_unreachable`（最近一次读账号表失败）、`outbox_stale`（积压超过 15 分钟）、`outbox_backlog`（超过 1000 条）、`outbox_write_failed`（队列文件写不进去）；`warn_` 开头的只提醒、不让 `ok` 变 false：`warn_undeclared_checkbox:<列>`、`warn_request_rows_dropped`。具体原因看服务器 stderr。
+`GET /internal/auth/health`：`{ok, outbox_pending, oldest_pending_seconds, dropped_request_rows, dropped_login_rows, problems}`，有问题回 503，不带个人信息、表 ID、错误原文。问题码：`accounts_column:<列>`、`log_column:<列>`、`feature_column:<key>`、`accounts_unreachable`（最近一次读账号表失败）、`outbox_stale`（积压超过 15 分钟）、`outbox_backlog`（超过 1000 条）、`outbox_write_failed`（队列文件写不进去）；`warn_` 开头的只提醒、不让 `ok` 变 false：`warn_undeclared_checkbox:<列>`、`warn_request_rows_dropped`、`warn_login_rows_dropped`。具体原因看服务器 stderr。
 
 不做注册、忘记密码、自己改密码：都由管理员在表里改。
 
@@ -204,14 +218,14 @@ node ~/.claude/skills/feishu-login-guide/templates/backend/anycross-sso/scripts/
 
 ## 改模板的规矩
 
-- 两个模板行为一一对应，改一个就改另一个，然后 `bash conformance/selftest.sh`（约 5 分钟），两边都要 61/61。
-- 改了合规测试，跑 `node conformance/mutants.mjs`，56 个坏版本都要被抓到；新加的规则也补一个坏版本。
+- 两个模板行为一一对应，改一个就改另一个，然后 `bash conformance/selftest.sh`（约 5 分钟），两边都要 68/68。
+- 改了合规测试，跑 `node conformance/mutants.mjs`，70 个坏版本都要被抓到；新加的规则也补一个坏版本。
 
 ## 有意没做的（模板里标了 `shortcut:`）
 
 - 撤销 refresh_token 失败只记日志、不重试：会话已删、令牌只在服务端出现过，风险小。要做到必撤，就把加密令牌连同删会话一起写进待撤销表，后台重试。
 - 防并发回调重复换码只在同一实例内有效；多实例要防，就把登录事务放进共享库原子消费。
-- 账号密码连错次数只在本实例内存里计数，重启清零；多实例要严格限次，就把计数放进共享库。
+- 账号密码连错次数、登录限速、日志额度只在本实例内存里计数，重启清零；多实例要严格限次，就把计数放进共享库。
 - 没有跨实例的刷新锁：并发刷新靠版本号比对加「用户信息 401 先看库里」兜住，不会误踢人。
 - 黑盒测不到的：多实例并发、存储写失败、「每写 500 行查一次日志表行数」（只测了启动时那次）、兜底对账叫醒退避中的待写队列。实现 `Store` 时自己给前两处写单元测试。
 - 待写队列和名单只适合单实例（`FileStore`、本地队列文件）；多实例时每个实例各跑一份兜底对账，账号表多读几次，结果一样。

@@ -246,6 +246,8 @@ function fakeFeishu() {
     tables: new Map(), // table_id → { app, fields: [{field_name, type, field_id, property}], rows: Map(record_id → {列名: 值}) }
     // 按表注入故障：'error' 回 500、'timeout' 拖 8 秒、'writes' 只让写入（含删除）失败
     down: {},
+    // 按表加延迟（毫秒）：让项目的处理慢一点，测并发和重跑
+    latency: {},
     writes: [], // 每次写成功：{ table, kind: 'update'|'create'|'delete', records }
     calls: [], // 每次调开放平台接口（含换 token、失败的）：{ at, method, path, full }
     seq: 0,
@@ -272,6 +274,16 @@ function fakeFeishu() {
       const t = fs.tables.get(tableId);
       t.fields = t.fields.filter((f) => f.field_name !== name);
       for (const row of t.rows.values()) delete row[name];
+    },
+    renameField(tableId, from, to) {
+      const t = fs.tables.get(tableId);
+      t.fields.find((f) => f.field_name === from).field_name = to;
+      for (const row of t.rows.values()) {
+        if (from in row) {
+          row[to] = row[from];
+          delete row[from];
+        }
+      }
     },
     addField(tableId, name, type) {
       fs.tables.get(tableId).fields.push({ field_name: name, type, field_id: 'fld' + (++fs.seq), property: null });
@@ -302,6 +314,7 @@ function fakeFeishu() {
       const t = fs.tables.get(tableId);
       if (!t || t.app !== app) return send(200, { code: 1254004, msg: 'WrongTableId' });
       const isWrite = rest === 'batch_update' || rest === 'batch_create' || rest === 'batch_delete';
+      if (fs.latency[tableId]) await new Promise((r) => setTimeout(r, fs.latency[tableId]));
       const mode = fs.down[tableId];
       if (mode === 'timeout') await new Promise((r) => setTimeout(r, 8000));
       if (mode === 'error' || mode === 'timeout' || (mode === 'writes' && isWrite)) return send(500, { code: 1255001, msg: 'InternalError' });

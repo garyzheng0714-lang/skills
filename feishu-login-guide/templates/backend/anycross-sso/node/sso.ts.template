@@ -7,6 +7,8 @@
 
 import { createCipheriv, createDecipheriv, createHash, createHmac, createPublicKey, randomBytes, timingSafeEqual, verify } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from 'node:fs';
+import { open as openFile, rename as renameFile } from 'node:fs/promises';
+import { BlockList, isIPv6 } from 'node:net';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import * as oidc from 'openid-client';
 
@@ -51,17 +53,31 @@ const OUTBOX_BATCH = 500;
 const OUTBOX_MAX_BACKOFF_MS = 5 * MINUTE;
 const OUTBOX_STALE_MS = 15 * MINUTE;
 const OUTBOX_BACKLOG_LIMIT = 1000;
-// 一个进程最近一分钟最多新增这么多行请求日志，多的丢掉（防扫描器刷满日志表：飞书一张表最多两三万到五万行）。
+// 一个进程最近一分钟最多新增这么多行请求日志、登录失败日志，多的丢掉（防扫描器刷满日志表：飞书一张表最多两三万到五万行）。
+// 登录失败不用登录就能造出来，额度单独算、比请求少。
 const REQUEST_ROWS_PER_MINUTE = 200;
+const LOGIN_FAIL_ROWS_PER_MINUTE = 30;
 const DROPPED_WARN_MS = 15 * MINUTE;
+// 一样的日志行（请求：方法、路径、状态码、人；登录失败：方式、IP、账号、原因）10 秒内最多新起一行，
+// 这期间再来的攒进那一行的「次数」，到点再写出去。
+const LOG_MERGE_WINDOW_MS = 10_000;
+const ROW_REQUEST = 'request';
+const ROW_LOGIN_FAIL = 'login_fail';
+type RowClass = typeof ROW_REQUEST | typeof ROW_LOGIN_FAIL;
 
-// 日志表留多少行（2026-10-16 用户同意请求日志「只留最新的」）：每写 500 行查一次总行数，
-// 超了就删最旧的「请求」行，删到上限的 90%；登录、退出、被收回的行永远不删。
+// 日志表留多少行（2026-10-16 用户同意请求日志「只留最新的」）：每写 500 行查一次总行数，超了按时间从旧到新删，
+// 删到上限的 90%：先删「登录失败」，不够再删「请求」，还不够才删别的（登录成功、退出、被收回），表永远不会满到写不进去。
 const DEFAULT_LOG_MAX_ROWS = 45_000;
 const LOG_TRIM_EVERY = 500;
 
-// 账号表变更提醒：同一行同时只处理一次，全局每分钟最多处理这么多次（伪造的提醒再多也只多读几次表）。
+// 账号表变更提醒：同一行同时只处理一次，全局每分钟最多处理这么多次（处理完再来一遍也算一次），
+// 伪造的提醒再多也只多读几次表；提醒顺带的表结构检查最多每分钟一次（兜底对账每轮照查）。
 const ACCOUNTS_CHANGED_PER_MINUTE = 60;
+const SCHEMA_EVENT_GAP_MS = MINUTE;
+
+// 账号密码登录限速（每次登录都要当场查一次账号表）：每个 IP 每分钟最多 10 次，整个进程每分钟最多查 60 次表，超了回 429。
+const ACCOUNT_LOGINS_PER_IP = 10;
+const ACCOUNT_LOOKUPS_PER_MINUTE = 60;
 
 /** 账号密码登录的人没有集成平台身份，company_code 记成这个，和 FBIF、富的分开。 */
 export const ACCOUNT_COMPANY_CODE = 'account';
@@ -105,6 +121,13 @@ const TYPE_REVOKED = '被收回';
 const TYPE_REQUEST = '请求';
 const RESULT_OK = '成功';
 const RESULT_FAIL = '失败';
+// 日志表超了时删的顺序，每一类都按时间从旧到新：先删「登录失败」（不用登录就能造出来），
+// 不够再删「请求」，还不够才删别的（登录成功、退出、被收回），表永远不会被删不掉的行塞满。null 是不分类型。
+const LOG_TRIM_ORDER: unknown[] = [
+  { conjunction: 'and', conditions: [{ field_name: '类型', operator: 'is', value: [TYPE_LOGIN] }, { field_name: '结果', operator: 'is', value: [RESULT_FAIL] }] },
+  { conjunction: 'and', conditions: [{ field_name: '类型', operator: 'is', value: [TYPE_REQUEST] }] },
+  null,
+];
 
 type Target = 'log' | 'accounts';
 
@@ -236,6 +259,8 @@ export interface Sso {
   requireUser: Handler;
   /** 给 HR、盖章、改权限、敏感导出：每次当场找集成平台核对，核对不了就拒绝；账号密码会话一律 403 */
   requireFreshUser: Handler;
+  /** 进程退出前调（server.close 之后）：把待写队列里还没落盘的改动落盘（最多等 ms 毫秒，默认 5 秒），重启后接着写 */
+  shutdown(ms?: number): Promise<void>;
 }
 
 /** 当前用户能不能用某个功能（Options.features 里的 key），只在 requireUser 包住的接口里有意义 */
@@ -467,6 +492,8 @@ export async function createSso(opts: Options): Promise<Sso> {
   const record = (e: LoginEvent) => {
     if (!logTable || !outbox) return;
     const [type, result] = typeAndResult(e);
+    // 不用登录就能造出来的行：一样的合成一行记次数，再按额度限量，不能拿它刷满共用的日志表。
+    if (e.event === EVENT_LOGIN_FAIL) e = { ...e, mergeKey: [ROW_LOGIN_FAIL, e.method, e.ip, e.account, e.reason].join('\x00') };
     const f: Record<string, unknown> = { 摘要: clip(summary(e), 200), 时间: Date.now(), 项目: [projectRec], 类型: type, 次数: 1 };
     if (result) f.结果 = result;
     if (e.status) {
@@ -633,19 +660,41 @@ export async function createSso(opts: Options): Promise<Sso> {
 
   // ---------- 账号密码 ----------
 
-  // shortcut: 连错次数只在本实例内存里计数。
-  const fails = new Map<string, { n: number; first: number }>();
-  const allowAttempt = (name: string) => {
-    const f = fails.get(name);
-    return !f || f.n < ACCOUNT_FAIL_LIMIT || Date.now() - f.first > ACCOUNT_LOCK_MS;
-  };
-  /** 记一次失败；这一次正好凑满 5 次时返回解锁时间 */
-  const recordFailure = (name: string): number | null => {
-    if (fails.size > 10_000) for (const [k, f] of fails) if (Date.now() - f.first > ACCOUNT_LOCK_MS) fails.delete(k);
+  // shortcut: 连错次数、限速只在本实例内存里计数。
+  /** n 是这 15 分钟连错几次，inflight 是正在查表还没出结果的，known 是之前在表里查到过这个账号 */
+  const fails = new Map<string, { n: number; inflight: number; first: number; known: boolean }>();
+  const loginsPerIp = new PerMinute(ACCOUNT_LOGINS_PER_IP);
+  const lookups = new PerMinute(ACCOUNT_LOOKUPS_PER_MINUTE);
+  /** 取一个账号这 15 分钟的记录（过了 15 分钟从零算，正在查的照留） */
+  const failsOf = (name: string) => {
+    if (fails.size > 10_000) for (const [k, f] of fails) if (f.inflight === 0 && Date.now() - f.first > ACCOUNT_LOCK_MS) fails.delete(k);
     let f = fails.get(name);
-    if (!f || Date.now() - f.first > ACCOUNT_LOCK_MS) fails.set(name, (f = { n: 0, first: Date.now() }));
+    if (!f || Date.now() - f.first > ACCOUNT_LOCK_MS) fails.set(name, (f = { n: 0, inflight: f?.inflight ?? 0, first: Date.now(), known: f?.known ?? false }));
+    return f;
+  };
+  /**
+   * 查表前先占一次尝试（同步、不让出事件循环，等于在锁里）：连错次数加上正在查的凑满 5 次就不让查，并发猜密码也凑不出第 6 次。
+   * locked 是已经连错满 5 次；known 是之前在表里查到过这个账号。
+   */
+  const reserveAttempt = (name: string) => {
+    const f = failsOf(name);
+    if (f.n >= ACCOUNT_FAIL_LIMIT) return { known: f.known, ok: false, locked: true };
+    if (f.n + f.inflight >= ACCOUNT_FAIL_LIMIT) return { known: f.known, ok: false, locked: false };
+    f.inflight++;
+    return { known: f.known, ok: true, locked: false };
+  };
+  /** 退回占着的一次（查不了表、被限速，不算连错） */
+  const releaseAttempt = (name: string) => {
+    const f = fails.get(name);
+    if (f && f.inflight > 0) f.inflight--;
+  };
+  /** 把占着的一次记成失败；这一次正好凑满 5 次时返回 true */
+  const failAttempt = (name: string, known: boolean) => {
+    const f = failsOf(name);
+    if (f.inflight > 0) f.inflight--;
     f.n++;
-    return f.n === ACCOUNT_FAIL_LIMIT ? f.first + ACCOUNT_LOCK_MS : null;
+    f.known ||= known;
+    return f.n === ACCOUNT_FAIL_LIMIT;
   };
   /** 此刻锁着的账号 → 解锁时间 */
   const lockedNames = () => {
@@ -660,15 +709,16 @@ export async function createSso(opts: Options): Promise<Sso> {
   const credential = (password: string) => createHmac('sha256', credKey).update(password.trim()).digest('hex').slice(0, 16);
 
   /** 判这次账号登录：返回对上的那一行，不让进时返回原因（只写日志，不回给浏览器） */
-  const loginVerdict = (rows: AccountRow[], password: string): [AccountRow | null, string] => {
-    if (rows.length === 0) return [null, '账号不存在'];
-    if (rows.length > 1) return [null, '账号重复'];
+  /** fromColumns 是这个原因来自可能被改了名的列（缺密码、账号状态不是启用），当真之前要先确认列没问题 */
+  const loginVerdict = (rows: AccountRow[], password: string): [AccountRow | null, string, boolean] => {
+    if (rows.length === 0) return [null, '账号不存在', false];
+    if (rows.length > 1) return [null, '账号重复', false];
     const row = rows[0];
     const stored = row.password.trim();
-    if (!stored) return [row, '配置有误：缺密码'];
-    if (!samePassword(stored, password)) return [row, '密码不对'];
-    if (row.enabled !== ENABLED_VALUE) return [row, enabledRefusal(row.enabled)];
-    return [row, ''];
+    if (!stored) return [row, '配置有误：缺密码', true];
+    if (!samePassword(stored, password)) return [row, '密码不对', false];
+    if (row.enabled !== ENABLED_VALUE) return [row, enabledRefusal(row.enabled), true];
+    return [row, '', false];
   };
 
   /** 登着的账号会话要下线的原因，空串是不用下线 */
@@ -709,62 +759,77 @@ export async function createSso(opts: Options): Promise<Sso> {
     const name = normalizeUsername(typed);
     // 密码前后不会有空白；转发时常多带一个空格或换行。
     const password = typeof input.password === 'string' ? input.password.trim() : '';
-    let ev: LoginEvent = { ...requestEvent(req, METHOD_ACCOUNT), account: clip(typed.trim(), 100) };
-    if (!allowAttempt(name)) {
-      record({ ...ev, event: EVENT_LOGIN_FAIL, reason: '已锁定' });
-      return sendJson(res, 429, { error: 'rate_limited' });
-    }
-    /** 按账号查到的行，拒绝时把它们的「状态」一起对一遍 */
-    let found: AccountRow[] = [];
-    const refuse = (row: AccountRow | null, reason: string) => {
-      const lockedNow = recordFailure(name) !== null;
-      // 凑满 5 次时 writeStatuses 会把这一行写成「已锁定」和解锁时间。
-      writeStatuses(found);
-      if (lockedNow) reason += '（连错 5 次，已锁定）';
-      console.log(`sso: account login ${JSON.stringify(name)} refused: ${reason}`);
-      record({ ...ev, recordId: row?.id ?? ev.recordId, event: EVENT_LOGIN_FAIL, reason });
-      sendJson(res, 401, { error: 'auth_failed' });
+    // 还不知道有没有这个账号：先打码（常有人把密码填进账号栏），表里查到了才写原文。
+    let ev: LoginEvent = { ...requestEvent(req, METHOD_ACCOUNT), account: maskAccount(typed.trim()) };
+    const deny = (status: number, code: string, reason: string) => {
+      console.log(`sso: account login ${JSON.stringify(ev.account)} refused: ${reason}`);
+      record({ ...ev, event: EVENT_LOGIN_FAIL, reason });
+      sendJson(res, status, { error: code });
     };
-    if (!accountsTable) return refuse(null, '本项目没开账号密码登录');
-    if (!name) return refuse(null, '没填账号');
-    if (!password) return refuse(null, '没填密码');
-    let rows: AccountRow[];
+    if (!loginsPerIp.allow(ev.ip ?? '')) return deny(429, 'rate_limited', '请求太频繁');
+    const { known, ok, locked } = reserveAttempt(name);
+    if (known) ev.account = clip(typed.trim(), 100);
+    if (!ok) return deny(429, 'rate_limited', locked ? '已锁定' : '同时尝试太多次');
+    // 查表前占了一次尝试；没出结果（查不了表、限速）就退回去，不算连错。
+    let settled = false;
     try {
-      rows = found = await findAccount(name);
-    } catch (e) {
-      console.log(`sso: account login ${JSON.stringify(name)}: accounts table: ${describe(e)}`);
-      record({ ...ev, event: EVENT_LOGIN_FAIL, reason: '查表失败' });
-      return sendJson(res, 503, { error: 'login_service_unavailable' });
+      const columnsOK = columnsCheck();
+      /** 按账号查到的行，拒绝时把它们的「状态」一起对一遍 */
+      let found: AccountRow[] = [];
+      const refuse = (row: AccountRow | null, reason: string) => {
+        settled = true;
+        // 凑满 5 次时 writeStatuses 会把这一行写成「已锁定」和解锁时间。
+        if (failAttempt(name, found.length > 0)) reason += '（连错 5 次，已锁定）';
+        void writeStatuses(found, columnsOK);
+        if (row) ev.recordId = row.id;
+        deny(401, 'auth_failed', reason);
+      };
+      if (!accountsTable) return refuse(null, '本项目没开账号密码登录');
+      if (!name) return refuse(null, '没填账号');
+      if (!password) return refuse(null, '没填密码');
+      if (!lookups.allow()) return deny(429, 'rate_limited', '请求太频繁');
+      // 账号表的列有问题（改了列名、类型）时读回来的空值不能当真：按查不了表处理。
+      if (accountColumnsBroken() && !(await columnsOK())) return deny(503, 'login_service_unavailable', '查表失败：账号表的列有问题');
+      let rows: AccountRow[];
+      try {
+        rows = found = await findAccount(name);
+      } catch (e) {
+        console.log(`sso: account login ${JSON.stringify(ev.account)}: accounts table: ${describe(e)}`);
+        return deny(503, 'login_service_unavailable', '查表失败');
+      }
+      if (rows.length) ev.account = clip(typed.trim(), 100);
+      const [row, reason, fromColumns] = loginVerdict(rows, password);
+      if (fromColumns && !(await columnsOK())) return deny(503, 'login_service_unavailable', '查表失败：账号表的列有问题');
+      if (reason || !row) return refuse(row, reason);
+      settled = true;
+      fails.delete(name);
+      const identity: Identity = { company_code: ACCOUNT_COMPANY_CODE, sub: row.id, name: row.username.trim() };
+      ev = { ...withIdentity(ev, identity), recordId: row.id };
+      let userId: string;
+      try {
+        userId = await opts.onLogin(identity);
+      } catch (e) {
+        if (e instanceof NotAllowedError) return refuse(row, '本项目不让进');
+        console.log(`sso: onLogin ${identityKey(identity)}: ${describe(e)}`);
+        return deny(503, 'login_service_unavailable', 'onLogin 出错');
+      }
+      const sid = randomBytes(32).toString('base64url');
+      const now = Date.now();
+      const session: Session = { idHash: hashId(sid), userId, identity, refreshSeal: '', createdAt: now, checkedAt: now, lastSeenAt: now, version: 1, account: true, accountCredential: credential(row.password), features: checkedFeatures(row) };
+      try {
+        await store.createSession(session);
+      } catch (e) {
+        console.log(`sso: create session: ${describe(e)}`);
+        return deny(503, 'login_service_unavailable', '建会话失败');
+      }
+      setCookie(res, SESSION_COOKIE, sid, SESSION_IDLE_MS + TOUCH_EVERY_MS);
+      console.log(`sso: login ${identityKey(identity)} user=${userId}`);
+      writeBack(row.id, { [COL_STATUS]: STATUS_OK, [COL_NOTE]: '', [COL_LAST_LOGIN]: now });
+      record({ ...ev, event: EVENT_LOGIN_OK, session: sessionTag(session.idHash), permissions: permissionColumns(session.features!) });
+      sendJson(res, 200, { ok: true });
+    } finally {
+      if (!settled) releaseAttempt(name);
     }
-    const [row, reason] = loginVerdict(rows, password);
-    if (reason || !row) return refuse(row, reason);
-    fails.delete(name);
-    const identity: Identity = { company_code: ACCOUNT_COMPANY_CODE, sub: row.id, name: row.username.trim() };
-    ev = { ...withIdentity(ev, identity), recordId: row.id };
-    let userId: string;
-    try {
-      userId = await opts.onLogin(identity);
-    } catch (e) {
-      if (e instanceof NotAllowedError) return refuse(row, '本项目不让进');
-      console.log(`sso: onLogin ${identityKey(identity)}: ${describe(e)}`);
-      record({ ...ev, event: EVENT_LOGIN_FAIL, reason: 'onLogin 出错' });
-      return sendJson(res, 503, { error: 'login_service_unavailable' });
-    }
-    const sid = randomBytes(32).toString('base64url');
-    const now = Date.now();
-    const session: Session = { idHash: hashId(sid), userId, identity, refreshSeal: '', createdAt: now, checkedAt: now, lastSeenAt: now, version: 1, account: true, accountCredential: credential(row.password), features: checkedFeatures(row) };
-    try {
-      await store.createSession(session);
-    } catch (e) {
-      console.log(`sso: create session: ${describe(e)}`);
-      record({ ...ev, event: EVENT_LOGIN_FAIL, reason: '建会话失败' });
-      return sendJson(res, 503, { error: 'login_service_unavailable' });
-    }
-    setCookie(res, SESSION_COOKIE, sid, SESSION_IDLE_MS + TOUCH_EVERY_MS);
-    console.log(`sso: login ${identityKey(identity)} user=${userId}`);
-    writeBack(row.id, { [COL_STATUS]: STATUS_OK, [COL_NOTE]: '', [COL_LAST_LOGIN]: now });
-    record({ ...ev, event: EVENT_LOGIN_OK, session: sessionTag(session.idHash), permissions: permissionColumns(session.features!) });
-    sendJson(res, 200, { ok: true });
   };
 
   // 每个核对周期按 record_id 读一次那一行：删了、账号状态不是启用、密码改了就下线，否则更新功能和名字。
@@ -792,13 +857,19 @@ export async function createSso(opts: Options): Promise<Sso> {
         return inGrace ? cur : 503;
       }
       accountsRead(null);
-      retryAfter.delete(cur.idHash);
       if (!rec) {
+        retryAfter.delete(cur.idHash);
         await revokeSession(req, cur.idHash, '账号已删除');
         return 401;
       }
       const row = parseAccountRow(rec);
       const reason = revokeReason(row, cur.accountCredential ?? '');
+      // 停用、改密码都是看列读出来的：列被改了名读回空值，不能拿它踢人，按读不到表处理。
+      if (reason && !(await columnsCheck()())) {
+        retryAfter.set(cur.idHash, Date.now() + OUTAGE_BACKOFF_MS);
+        return inGrace ? cur : 503;
+      }
+      retryAfter.delete(cur.idHash);
       if (reason) {
         console.log(`sso: account ${cur.identity.sub} ${reason}, ending session`);
         await revokeSession(req, cur.idHash, reason);
@@ -820,20 +891,36 @@ export async function createSso(opts: Options): Promise<Sso> {
 
   // ---------- 兜底对账、账号表变更提醒 ----------
 
+  /** 查一次账号表的列，换上新的问题；读不到返回 false */
+  const checkAccountColumns = async () => {
+    try {
+      const fields = await feishu!.fields(accountsTable!);
+      accountsRead(null);
+      setIssues('accounts', accountSchemaIssues(fields, features));
+      return true;
+    } catch (e) {
+      accountsRead(e);
+      console.log(`sso: accounts table fields: ${describe(e)}`);
+      return false;
+    }
+  };
+
+  /** 上次查到账号表系统要读写的列有问题（accounts_column:*，不含功能列） */
+  const accountColumnsBroken = () => [...issues.accounts.keys()].some((c) => c.startsWith('accounts_column:'));
+
+  /**
+   * 给一次操作用：第一次调用时当场查一次账号表的列，之后返回同一个结果。列读得到、没问题才是 true。
+   * 要按读出来的值踢人、拒绝登录、改「状态」之前调它：管理员改了列名，读回来的空值会被当成停用或改了密码。
+   */
+  const columnsCheck = () => {
+    let p: Promise<boolean> | null = null;
+    return () => (p ??= checkAccountColumns().then((ok) => ok && !accountColumnsBroken()));
+  };
+
   /** 查两张表的列，换上新的表结构问题；有一张读不到返回 false */
   const checkSchema = async () => {
     let ok = true;
-    if (accountsTable) {
-      try {
-        const fields = await feishu!.fields(accountsTable);
-        accountsRead(null);
-        setIssues('accounts', accountSchemaIssues(fields, features));
-      } catch (e) {
-        accountsRead(e);
-        console.log(`sso: accounts table fields: ${describe(e)}`);
-        ok = false;
-      }
-    }
+    if (accountsTable && !(await checkAccountColumns())) ok = false;
     if (logTable) {
       try {
         setIssues('log', columnIssues('log_column:', await feishu!.fields(logTable), LOG_COLUMNS));
@@ -845,19 +932,30 @@ export async function createSso(opts: Options): Promise<Sso> {
     return ok;
   };
 
-  /** 把同一个账号名的几行的「状态」「状态说明」算一遍，对不上的写回 */
-  const writeStatuses = (rows: AccountRow[]) => {
+  /** 把同一个账号名的几行的「状态」「状态说明」算一遍，对不上的写回；要写之前先确认账号表的列没问题 */
+  const writeStatuses = async (rows: AccountRow[], columnsOK: () => Promise<boolean>) => {
     const locked = lockedNames();
+    const changes: [string, Record<string, unknown>][] = [];
     for (const row of rows) {
       if (isBlank(row)) continue;
       const [status, note] = accountRowStatus({ row, duplicate: rows.length > 1, lockedUntil: locked.get(normalizeUsername(row.username)) ?? 0 });
-      if (status !== row.status || note !== row.note) writeBack(row.id, { [COL_STATUS]: status, [COL_NOTE]: note });
+      // 表里读到的是还没写成的写回之前的值：叠上队列里这一行还没写成的，才知道要不要再写。
+      const pending = outbox!.pendingAccount(row.id);
+      const cur = typeof pending[COL_STATUS] === 'string' ? pending[COL_STATUS] : row.status;
+      const curNote = typeof pending[COL_NOTE] === 'string' ? pending[COL_NOTE] : row.note;
+      if (status !== cur || note !== curNote) changes.push([row.id, { [COL_STATUS]: status, [COL_NOTE]: note }]);
     }
+    if (!changes.length || !(await columnsOK())) return;
+    for (const [id, fields] of changes) writeBack(id, fields);
   };
 
-  /** 按刚读到的那一行处理一个账号会话（row 为 null 是那一行删了）：删了、账号状态不是启用、密码改了就下线，返回 false；否则更新名字和功能 */
-  const settleAccountSession = async (sess: Session, row: AccountRow | null) => {
+  /**
+   * 按刚读到的那一行处理一个账号会话（row 为 null 是那一行删了）：删了、账号状态不是启用、密码改了就下线，返回 false；否则更新名字和功能。
+   * 停用、改密码是看列读出来的，账号表的列有问题时不当真、不下线。
+   */
+  const settleAccountSession = async (sess: Session, row: AccountRow | null, columnsOK: () => Promise<boolean>) => {
     const reason = row ? revokeReason(row, sess.accountCredential ?? '') : '账号已删除';
+    if (reason && row && !(await columnsOK())) return true;
     if (reason) {
       console.log(`sso: account ${sess.identity.sub} ${reason}, ending session`);
       await revokeSession(null, sess.idHash, reason);
@@ -872,6 +970,11 @@ export async function createSso(opts: Options): Promise<Sso> {
   const reconcileOnce = async () => {
     if (!(await checkSchema())) return false;
     if (!accountsTable) return true;
+    // 账号表的列有问题时读出来的值不能当真（停用、改密码都会误判）：这一轮什么都不做，退避后再查。
+    if (accountColumnsBroken()) {
+      console.log('sso: reconcile: accounts table columns broken, not touching sessions');
+      return false;
+    }
     const readAt = Date.now();
     let recs: BitableRecord[];
     try {
@@ -896,37 +999,42 @@ export async function createSso(opts: Options): Promise<Sso> {
       const key = normalizeUsername(row.username);
       groups.set(key, [...(groups.get(key) ?? []), row]);
     }
+    const columnsOK = columnsCheck();
     let ended = 0;
     for (const sess of sessions) {
       // 读表之后才登录或核对过的会话不动：它比这份表新。
       if (sess.checkedAt > readAt) continue;
-      if (!(await settleAccountSession(sess, rows.get(sess.identity.sub) ?? null))) ended++;
+      if (!(await settleAccountSession(sess, rows.get(sess.identity.sub) ?? null, columnsOK))) ended++;
     }
-    for (const g of groups.values()) writeStatuses(g);
+    for (const g of groups.values()) await writeStatuses(g, columnsOK);
     console.log(`sso: reconcile: ${recs.length} account rows, ${sessions.length} sessions checked, ${ended} ended`);
     return true;
   };
 
   /** record_id → 处理完要不要再来一遍（正在处理时又来了提醒） */
   const changing = new Map<string, boolean>();
-  let changedTimes: number[] = [];
+  const changeQuota = new PerMinute(ACCOUNTS_CHANGED_PER_MINUTE);
+  let schemaEventAt = 0;
   /** 同一行正在处理时只记一笔「处理完再来一遍」；全局最近一分钟最多处理 60 次，多的丢掉（用户下一个请求照样会核对） */
   const claimChange = (id: string) => {
     if (changing.has(id)) {
       changing.set(id, true);
       return false;
     }
-    const now = Date.now();
-    changedTimes = changedTimes.filter((t) => now - t <= MINUTE);
-    if (changedTimes.length >= ACCOUNTS_CHANGED_PER_MINUTE) return false;
-    changedTimes.push(now);
+    if (!changeQuota.allow()) return false;
     changing.set(id, false);
+    return true;
+  };
+  /** 变更提醒这一次要不要顺带查表结构：最多每分钟一次 */
+  const eventSchemaDue = () => {
+    if (Date.now() - schemaEventAt < SCHEMA_EVENT_GAP_MS) return false;
+    schemaEventAt = Date.now();
     return true;
   };
 
   /** 读那一行：删了、账号状态不是启用、密码改了，就让绑在这一行上的会话全部下线；否则更新名字和功能。最后把同名几行的「状态」对一遍 */
   const applyAccountChange = async (id: string) => {
-    await checkSchema();
+    if (eventSchemaDue()) await checkSchema();
     let rec: BitableRecord | null;
     try {
       rec = await feishu!.get(accountsTable!, id);
@@ -941,7 +1049,8 @@ export async function createSso(opts: Options): Promise<Sso> {
       return [] as Session[];
     });
     const row = rec ? parseAccountRow(rec) : null;
-    for (const sess of sessions) if (sess.identity.sub === id) await settleAccountSession(sess, row);
+    const columnsOK = columnsCheck();
+    for (const sess of sessions) if (sess.identity.sub === id) await settleAccountSession(sess, row, columnsOK);
     if (!row) return;
     // 同名的几行一起对（这一行改了名，可能和别的行重了）。
     let group = [row];
@@ -950,13 +1059,14 @@ export async function createSso(opts: Options): Promise<Sso> {
       const rows = await findAccount(name).catch(() => null);
       if (rows) group = rows.some((r) => r.id === id) ? rows : [...rows, row];
     }
-    writeStatuses(group);
+    await writeStatuses(group, columnsOK);
   };
 
+  /** 处理一行；处理期间又来了提醒就再来一遍，再来的这一遍也占每分钟 60 次的名额，没名额就不来了 */
   const processChanges = async (id: string) => {
     for (;;) {
       await applyAccountChange(id).catch((e) => console.log(`sso: accounts-changed ${id}: ${describe(e)}`));
-      if (!changing.get(id)) {
+      if (!changing.get(id) || !changeQuota.allow()) {
         changing.delete(id);
         return;
       }
@@ -996,7 +1106,7 @@ export async function createSso(opts: Options): Promise<Sso> {
     }
   };
 
-  /** 日志表总行数超过 SSO_LOG_MAX_ROWS 时，删最旧的「请求」行（不分项目，日志表是共用的），删到上限的 90%；登录、退出、被收回的行永远不删 */
+  /** 日志表总行数超过 SSO_LOG_MAX_ROWS 时按 LOG_TRIM_ORDER 删最旧的行（不分项目，日志表是共用的），删到上限的 90%。失败只记 stderr，下次再说 */
   const trimLogTable = async () => {
     let total: number;
     try {
@@ -1007,21 +1117,22 @@ export async function createSso(opts: Options): Promise<Sso> {
     }
     if (total <= logMaxRows) return;
     const target = Math.floor((logMaxRows * 9) / 10);
-    const onlyRequests = { conjunction: 'and', conditions: [{ field_name: '类型', operator: 'is', value: [TYPE_REQUEST] }] };
     const oldestFirst = [{ field_name: '时间', desc: false }];
     let deleted = 0;
     try {
-      while (total > target) {
-        const recs = await feishu!.searchPage(logTable!, onlyRequests, oldestFirst, Math.min(OUTBOX_BATCH, total - target));
-        if (!recs.length) break;
-        await feishu!.batchDelete(logTable!, recs.map((r) => r.record_id));
-        total -= recs.length;
-        deleted += recs.length;
+      for (const filter of LOG_TRIM_ORDER) {
+        while (total > target) {
+          const recs = await feishu!.searchPage(logTable!, filter, oldestFirst, Math.min(OUTBOX_BATCH, total - target));
+          if (!recs.length) break;
+          await feishu!.batchDelete(logTable!, recs.map((r) => r.record_id));
+          total -= recs.length;
+          deleted += recs.length;
+        }
       }
     } catch (e) {
       console.log(`sso: log table trim: ${describe(e)}`);
     }
-    console.log(`sso: log table over ${logMaxRows} rows, deleted the ${deleted} oldest request rows`);
+    console.log(`sso: log table over ${logMaxRows} rows, deleted the ${deleted} oldest rows`);
   };
 
   if (outbox) {
@@ -1032,11 +1143,13 @@ export async function createSso(opts: Options): Promise<Sso> {
         let written = 0;
         if (target === 'log') await trimLogTable();
         for (;;) {
-          const batch = ob.take(target);
+          const { batch, next } = ob.take(target);
           if (!batch.length) {
-            await ob.waitFor(target);
+            await ob.waitFor(target, next);
             continue;
           }
+          // 写出去之前一定已在盘上：落盘在后台，这里等它落完这批。
+          await ob.flush(UPSTREAM_TIMEOUT_MS);
           let err: unknown = null;
           await deliver(target, batch).catch((e) => (err = e ?? new Error('failed')));
           ob.finish(batch, err === null);
@@ -1234,20 +1347,22 @@ export async function createSso(opts: Options): Promise<Sso> {
     if (accountsFailed) problems.push('accounts_unreachable');
     let pending = 0;
     let oldest = 0;
-    let dropped = 0;
+    let dropped: Record<RowClass, number> = { [ROW_REQUEST]: 0, [ROW_LOGIN_FAIL]: 0 };
     if (outbox) {
       const st = outbox.stats();
       pending = st.pending;
       dropped = st.dropped;
       if (st.oldest) oldest = Math.floor((Date.now() - st.oldest) / 1000);
-      if (st.droppedAt && Date.now() - st.droppedAt < DROPPED_WARN_MS) problems.push('warn_request_rows_dropped');
+      for (const [cls, warn] of [[ROW_REQUEST, 'warn_request_rows_dropped'], [ROW_LOGIN_FAIL, 'warn_login_rows_dropped']] as const) {
+        if (st.droppedAt[cls] && Date.now() - st.droppedAt[cls] < DROPPED_WARN_MS) problems.push(warn);
+      }
       if (oldest * 1000 > OUTBOX_STALE_MS) problems.push('outbox_stale');
       if (pending > OUTBOX_BACKLOG_LIMIT) problems.push('outbox_backlog');
       if (st.saveFailed) problems.push('outbox_write_failed');
     }
     problems.sort();
     const ok = problems.every((p) => p.startsWith('warn_'));
-    sendJson(res, ok ? 200 : 503, { ok, outbox_pending: pending, oldest_pending_seconds: oldest, dropped_request_rows: dropped, problems });
+    sendJson(res, ok ? 200 : 503, { ok, outbox_pending: pending, oldest_pending_seconds: oldest, dropped_request_rows: dropped[ROW_REQUEST], dropped_login_rows: dropped[ROW_LOGIN_FAIL], problems });
   };
 
   // ---------- 请求日志 ----------
@@ -1268,7 +1383,7 @@ export async function createSso(opts: Options): Promise<Sso> {
     void (async () => {
       const sess = note.sess ?? (sid ? await store.getSession(hashId(sid)).catch(() => null) : null);
       const row = sess ? sessionEvent(ev, sess, EVENT_REQUEST, ev.reason) : ev;
-      row.mergeKey = [row.verb, row.path, status, sess ? identityKey(sess.identity) : 'ip:' + ev.ip].join('\x00');
+      row.mergeKey = [ROW_REQUEST, row.verb, row.path, status, sess ? identityKey(sess.identity) : 'ip:' + ev.ip].join('\x00');
       record(row);
     })();
   };
@@ -1401,7 +1516,11 @@ export async function createSso(opts: Options): Promise<Sso> {
     next();
   };
 
-  return { routes, logRequests, requireUser: guard(false), requireFreshUser: guard(true) };
+  const shutdown = async (ms = 5000) => {
+    await outbox?.flush(ms);
+  };
+
+  return { routes, logRequests, requireUser: guard(false), requireFreshUser: guard(true), shutdown };
 }
 
 // ---------- 账号表的行 ----------
@@ -1519,13 +1638,27 @@ function validateFeatures(features: Feature[]) {
 
 // ---------- 登录日志小工具 ----------
 
-/** 依次认 X-Real-IP、X-Forwarded-For 第一个、直连地址，并记下用的是哪个 */
+const localPeers = new BlockList();
+for (const [net, bits] of [['127.0.0.0', 8], ['10.0.0.0', 8], ['172.16.0.0', 12], ['192.168.0.0', 16]] as const) localPeers.addSubnet(net, bits, 'ipv4');
+localPeers.addAddress('::1', 'ipv6');
+localPeers.addSubnet('fc00::', 7, 'ipv6');
+/** 直连的是本机或内网地址（就是前面的反向代理） */
+const isLocalPeer = (addr: string) => !!addr && localPeers.check(addr, isIPv6(addr) ? 'ipv6' : 'ipv4');
+
+/**
+ * 取访客 IP，并记下用的是哪个。直连的是本机或内网（就是前面的反向代理）时，认 X-Forwarded-For 最右边那个：
+ * 那是反向代理自己加的（Caddy 默认不信访客传来的 X-Forwarded-For、换成真实地址；nginx 的 $proxy_add_x_forwarded_for
+ * 把真实地址追加在最后），左边的都可能是访客自己写的。X-Real-IP 不认：Caddy 原样转发访客传来的值，谁都能伪造。
+ * 直连的是公网地址（前面没有反向代理），这些头一概不认，用直连地址。前面还有一层 CDN 时记到的是 CDN 的地址。
+ */
 function clientIp(req: IncomingMessage): [string, string] {
-  const real = String(req.headers['x-real-ip'] ?? '').trim();
-  if (real) return [real, 'X-Real-IP'];
-  const first = String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim();
-  if (first) return [first, 'X-Forwarded-For'];
-  return [(req.socket.remoteAddress ?? '').replace(/^::ffff:/, ''), 'RemoteAddr'];
+  const peer = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+  if (isLocalPeer(peer)) {
+    const raw = req.headers['x-forwarded-for'];
+    const last = (Array.isArray(raw) ? raw.join(',') : (raw ?? '')).split(',').pop()!.trim();
+    if (last) return [clip(last, 100), 'X-Forwarded-For'];
+  }
+  return [peer, 'RemoteAddr'];
 }
 
 function requestEvent(req: IncomingMessage, method: string): LoginEvent {
@@ -1576,6 +1709,33 @@ const sessionTag = (idHash: string) => idHash.slice(0, 12);
 /** 只留外部传来的错误码里的安全字符 */
 const cleanCode = (v: string) => clip(v.replace(/[^A-Za-z0-9_.-]/g, ''), 64);
 const clip = (v: string, max: number) => [...v].slice(0, max).join('');
+/** 没在表里查到的账号写进日志的样子：只留开头一两个字，后面打码、写出总长（常有人把密码填进账号栏） */
+function maskAccount(typed: string) {
+  const r = [...typed];
+  return r.length ? `${r.slice(0, Math.min(2, Math.floor(r.length / 2))).join('')}***（${r.length} 字）` : '';
+}
+
+/** 数每个 key 最近一分钟放行了几次，到了上限就不放（key 不给就是全局一个数） */
+class PerMinute {
+  private hits = new Map<string, number[]>();
+  private pruned = 0;
+  readonly limit: number;
+  constructor(limit: number) {
+    this.limit = limit;
+  }
+  allow(key = '') {
+    const now = Date.now();
+    if (now - this.pruned > MINUTE) {
+      for (const [k, ts] of this.hits) if (now - ts[ts.length - 1] > MINUTE) this.hits.delete(k);
+      this.pruned = now;
+    }
+    const ts = (this.hits.get(key) ?? []).filter((t) => now - t <= MINUTE);
+    this.hits.set(key, ts);
+    if (ts.length >= this.limit) return false;
+    ts.push(now);
+    return true;
+  }
+}
 
 // ---------- 小工具 ----------
 
@@ -1905,16 +2065,28 @@ interface OutboxItem {
   /** "log"：日志表新增一行；"accounts"：账号表更新 recordId 那一行 */
   target: Target;
   recordId?: string;
-  /** 请求日志的合并键：还没写出去的一样的请求合成一行 */
+  /** 可合并日志行的合并键（开头是类别 request / login_fail）：还没写出去的一样的行合成一行 */
   merge?: string;
   fields: Record<string, unknown>;
   at: number;
+  /** 同一键 10 秒内已写出过一行：到这个时间才写，期间再来的并进来 */
+  hold?: number;
+}
+
+/** 一类可合并日志行每分钟新增的额度，丢了多少给健康检查看 */
+interface RowBudget {
+  limit: PerMinute;
+  /** 正在丢（只在开始丢时记一行 stderr） */
+  dropping: boolean;
+  dropped: number;
+  droppedAt: number;
 }
 
 /**
- * 写日志表、写回账号表的持久队列：每次去写之前先 fsync 落盘，写成了才删；重启接着写。
- * 登录和请求从不等它（落盘也在后台），写不进去只在健康检查里报。同一行的写回合并成一条（后写的值为准），
- * 还没写出去的一样的请求日志合成一行（次数加一、耗时取最大）。
+ * 写日志表、写回账号表的持久队列：每次去写之前一定已落盘，写成了才删；重启接着写。
+ * 登录和请求从不等它：进队列只改内存，落盘在后台（异步写临时文件、fsync、改名，同一时间只有一个在写，
+ * 写的时候新来的改动攒着下一次一起落），写不进去只在健康检查里报。
+ * 同一行的写回合成一条（后写的值为准）；一样的请求、登录失败合成一行（次数加一），10 秒内同一键最多新起一行，两类各有每分钟的额度。
  */
 class Outbox {
   private seq = 0;
@@ -1925,13 +2097,19 @@ class Outbox {
   /** 在退避里等着的写入，兜底对账叫醒它 */
   private kicks = new Map<Target, () => void>();
   private saveFailed = false;
-  private saveQueued = false;
   private path: string;
-  /** 最近一分钟新增的请求日志行 */
-  private requestTimes: number[] = [];
-  private dropping = false;
-  private dropped = 0;
-  private droppedAt = 0;
+  /** 队列改过几次；最近一次落盘（成没成功都算）包含了前多少次改动 */
+  private gen = 0;
+  private savedGen = 0;
+  private saving = false;
+  private savedWaiters: (() => void)[] = [];
+  /** 合并键 → 这一键最近一行写出去的时间（暂存的那行算到点的时间） */
+  private recent = new Map<string, number>();
+  private prunedAt = 0;
+  private budgets: Record<RowClass, RowBudget> = {
+    [ROW_REQUEST]: { limit: new PerMinute(REQUEST_ROWS_PER_MINUTE), dropping: false, dropped: 0, droppedAt: 0 },
+    [ROW_LOGIN_FAIL]: { limit: new PerMinute(LOGIN_FAIL_ROWS_PER_MINUTE), dropping: false, dropped: 0, droppedAt: 0 },
+  };
 
   constructor(path: string, targets: Target[]) {
     this.path = path;
@@ -1963,8 +2141,17 @@ class Outbox {
       }
       if (dropped) console.error(`sso: outbox dropped ${dropped} entries for a table that is no longer configured`);
     }
+    // 启动时同步落一次盘：文件写不了就启动失败，说清是哪个变量。
     try {
-      this.save();
+      const tmp = path + '.tmp';
+      const fd = openSync(tmp, 'w', 0o600);
+      try {
+        writeSync(fd, JSON.stringify(this.items));
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, path);
     } catch (e) {
       throw new Error(`sso: SSO_OUTBOX_FILE: ${describe(e)}`);
     }
@@ -1977,15 +2164,17 @@ class Outbox {
 
   add(it: { target: Target; recordId?: string; merge?: string; fields: Record<string, unknown> }) {
     if (!this.mergeInto(it)) {
-      if (it.merge && !this.allowRequestRow()) return;
-      this.items.push({ id: ++this.seq, target: it.target, recordId: it.recordId, merge: it.merge, fields: { ...it.fields }, at: Date.now() });
+      const item: OutboxItem = { id: 0, target: it.target, recordId: it.recordId, merge: it.merge, fields: { ...it.fields }, at: Date.now() };
+      if (it.merge && !this.admit(item)) return;
+      item.id = ++this.seq;
+      this.items.push(item);
       this.trimLogs();
     }
-    this.queueSave();
+    this.changed();
     this.wake(it.target);
   }
 
-  /** 并进队列里还没写出去的同一条：账号表同一行后写的值为准；一样的请求日志次数加一、耗时取最大，时间留第一次的 */
+  /** 并进队列里还没写出去的同一条：账号表同一行后写的值为准；一样的日志行次数加一、耗时取最大，时间留第一次的 */
   private mergeInto(it: { target: Target; recordId?: string; merge?: string; fields: Record<string, unknown> }) {
     for (const e of this.items) {
       if (this.inflight.has(e.id) || e.target !== it.target) continue;
@@ -1995,27 +2184,41 @@ class Outbox {
       }
       if (it.merge && e.merge === it.merge) {
         e.fields.次数 = Number(e.fields.次数 ?? 1) + 1;
-        e.fields.耗时毫秒 = Math.max(Number(e.fields.耗时毫秒 ?? 0), Number(it.fields.耗时毫秒 ?? 0));
+        if ('耗时毫秒' in it.fields) e.fields.耗时毫秒 = Math.max(Number(e.fields.耗时毫秒 ?? 0), Number(it.fields.耗时毫秒 ?? 0));
         return true;
       }
     }
     return false;
   }
 
-  /** 最近一分钟新增的请求日志行到了 200 就丢，开始丢时记一行 stderr，健康检查里看得到丢了多少 */
-  private allowRequestRow() {
+  /**
+   * 决定一条可合并的日志能不能新起一行：这一类最近一分钟的额度用完就丢（开始丢时记一行 stderr，健康检查看得到丢了多少）；
+   * 同一键 10 秒内已写出过一行，这一行先暂存到窗口结束，期间再来的都并进它
+   */
+  private admit(it: OutboxItem) {
+    const cls = it.merge!.split('\x00')[0];
+    const b = this.budgets[cls as RowClass] ?? this.budgets[ROW_REQUEST];
     const now = Date.now();
-    this.requestTimes = this.requestTimes.filter((t) => now - t <= MINUTE);
-    if (this.requestTimes.length < REQUEST_ROWS_PER_MINUTE) {
-      this.requestTimes.push(now);
-      this.dropping = false;
-      return true;
+    if (!b.limit.allow()) {
+      if (!b.dropping) console.error(`sso: more than ${b.limit.limit} ${cls} log rows in a minute, dropping the rest`);
+      b.dropping = true;
+      b.dropped++;
+      b.droppedAt = now;
+      return false;
     }
-    if (!this.dropping) console.error(`sso: more than ${REQUEST_ROWS_PER_MINUTE} request log rows in a minute, dropping the rest`);
-    this.dropping = true;
-    this.dropped++;
-    this.droppedAt = now;
-    return false;
+    b.dropping = false;
+    if (now - this.prunedAt > LOG_MERGE_WINDOW_MS) {
+      for (const [k, t] of this.recent) if (now - t > LOG_MERGE_WINDOW_MS) this.recent.delete(k);
+      this.prunedAt = now;
+    }
+    let sendAt = now;
+    const last = this.recent.get(it.merge!);
+    if (last !== undefined && now - last < LOG_MERGE_WINDOW_MS) {
+      sendAt = last + LOG_MERGE_WINDOW_MS;
+      it.hold = sendAt;
+    }
+    this.recent.set(it.merge!, sendAt);
+    return true;
   }
 
   /** 日志超过上限时丢最旧的（正在写的不丢），并记 stderr */
@@ -2035,55 +2238,87 @@ class Outbox {
     } else this.pendingWake.add(target);
   }
 
-  /** 有改动就在后台落盘，登录和请求不用等 fsync */
-  private queueSave() {
-    if (this.saveQueued) return;
-    this.saveQueued = true;
-    setImmediate(() => {
-      this.saveQueued = false;
-      this.saveLogged();
+  /** 记一次改动并叫后台落盘 */
+  private changed() {
+    this.gen++;
+    if (this.saving) return;
+    this.saving = true;
+    setImmediate(() => void this.saveLoop());
+  }
+
+  /** 后台落盘：拍一份快照，异步写临时文件、fsync、改名；写的时候又有改动就再落一次。只在刚开始失败时记一行 stderr */
+  private async saveLoop() {
+    while (this.savedGen < this.gen) {
+      const gen = this.gen;
+      const raw = JSON.stringify(this.items);
+      const failedBefore = this.saveFailed;
+      try {
+        await writeSynced(this.path, raw);
+        this.saveFailed = false;
+      } catch (e) {
+        this.saveFailed = true;
+        if (!failedBefore) console.error(`sso: outbox write failed (kept in memory): ${describe(e)}`);
+      }
+      this.savedGen = gen;
+      for (const w of this.savedWaiters.splice(0)) w();
+    }
+    this.saving = false;
+  }
+
+  /** 等到此刻之前的改动都落过一次盘（写不进去也算落过：只在健康检查里报，不挡写出去），最多等 ms 毫秒 */
+  flush(ms: number): Promise<void> {
+    const want = this.gen;
+    if (this.savedGen >= want) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      const check = () => {
+        if (this.savedGen < want) return void this.savedWaiters.push(check);
+        clearTimeout(timer);
+        resolve();
+      };
+      check();
     });
   }
 
-  /** 落盘，只在刚开始失败时记一行 stderr */
-  private saveLogged() {
-    const failedBefore = this.saveFailed;
-    try {
-      this.save();
-    } catch (e) {
-      if (!failedBefore) console.error(`sso: outbox write failed (kept in memory): ${describe(e)}`);
-    }
-  }
-
-  private save() {
-    const tmp = this.path + '.tmp';
-    try {
-      const fd = openSync(tmp, 'w', 0o600);
-      try {
-        writeSync(fd, JSON.stringify(this.items));
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(tmp, this.path);
-      this.saveFailed = false;
-    } catch (e) {
-      this.saveFailed = true;
-      throw e;
-    }
-  }
-
-  /** 取一批（最多 500 条）去写，取之前先落盘：写出去之前一定已经在盘上 */
-  take(target: Target): OutboxItem[] {
+  /** 取一批（最多 500 条）去写；还没到点的暂存行不取，next 是最早到点的时间（没有是 0） */
+  take(target: Target): { batch: OutboxItem[]; next: number } {
+    if (target === 'accounts') this.collapseAccounts();
+    const now = Date.now();
     const batch: OutboxItem[] = [];
+    let next = 0;
     for (const it of this.items) {
       if (it.target !== target || this.inflight.has(it.id)) continue;
+      if (it.hold && it.hold > now) {
+        if (!next || it.hold < next) next = it.hold;
+        continue;
+      }
       this.inflight.add(it.id);
       batch.push({ ...it, fields: { ...it.fields } });
       if (batch.length === OUTBOX_BATCH) break;
     }
-    if (batch.length) this.saveLogged();
-    return batch;
+    return { batch, next };
+  }
+
+  /**
+   * 把还没在写的同一行账号写回并成一条（后写的值为准，时间留早的）：上一批写失败退回来的和这期间新进来的
+   * 会是同一行两条，一批里不能有两条同一行，旧值也不能盖掉新值
+   */
+  private collapseAccounts() {
+    const latest = new Map<string, OutboxItem>();
+    const drop = new Set<number>();
+    for (const it of this.items) {
+      if (it.target !== 'accounts' || this.inflight.has(it.id)) continue;
+      const older = latest.get(it.recordId!);
+      if (older) {
+        it.fields = { ...older.fields, ...it.fields };
+        it.at = older.at;
+        drop.add(older.id);
+      }
+      latest.set(it.recordId!, it);
+    }
+    if (!drop.size) return;
+    this.items = this.items.filter((it) => !drop.has(it.id));
+    this.changed();
   }
 
   /** 写失败后的退避：时间到，或兜底对账发现还有积压（kickBacklog），就返回 */
@@ -2104,10 +2339,25 @@ class Outbox {
     for (const t of new Set(this.items.map((it) => it.target))) this.kicks.get(t)?.();
   }
 
-  /** 等到这张表有东西进来；之前就有没取走的提醒立即返回 */
-  waitFor(target: Target): Promise<void> {
+  /** 等到这张表有东西进来，或到了 until（暂存行到点）；之前就有没取走的提醒立即返回 */
+  waitFor(target: Target, until = 0): Promise<void> {
     if (this.pendingWake.delete(target)) return Promise.resolve();
-    return new Promise((r) => this.wakers.set(target, r));
+    return new Promise((resolve) => {
+      const done = () => {
+        if (timer) clearTimeout(timer);
+        if (this.wakers.get(target) === done) this.wakers.set(target, null);
+        resolve();
+      };
+      const timer = until ? setTimeout(done, Math.max(0, until - Date.now())) : null;
+      this.wakers.set(target, done);
+    });
+  }
+
+  /** 账号表这一行还没写成的写回（含正在写的，后写的值为准） */
+  pendingAccount(recordId: string): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const it of this.items) if (it.target === 'accounts' && it.recordId === recordId) Object.assign(out, it.fields);
+    return out;
   }
 
   finish(batch: OutboxItem[], delivered: boolean) {
@@ -2115,16 +2365,31 @@ class Outbox {
     for (const id of done) this.inflight.delete(id);
     if (!delivered) return;
     this.items = this.items.filter((it) => !done.has(it.id));
-    this.saveLogged();
+    this.changed();
   }
 
   stats() {
+    const dropped = { [ROW_REQUEST]: this.budgets[ROW_REQUEST].dropped, [ROW_LOGIN_FAIL]: this.budgets[ROW_LOGIN_FAIL].dropped };
+    const droppedAt = { [ROW_REQUEST]: this.budgets[ROW_REQUEST].droppedAt, [ROW_LOGIN_FAIL]: this.budgets[ROW_LOGIN_FAIL].droppedAt };
     return {
       pending: this.items.length,
       oldest: this.items.reduce((m, it) => (m === 0 || it.at < m ? it.at : m), 0),
       saveFailed: this.saveFailed,
-      dropped: this.dropped,
-      droppedAt: this.droppedAt,
+      dropped,
+      droppedAt,
     };
   }
+}
+
+/** 写临时文件、fsync、改名，全程异步，不占事件循环 */
+async function writeSynced(path: string, raw: string) {
+  const tmp = path + '.tmp';
+  const fd = await openFile(tmp, 'w', 0o600);
+  try {
+    await fd.writeFile(raw);
+    await fd.sync();
+  } finally {
+    await fd.close();
+  }
+  await renameFile(tmp, path);
 }

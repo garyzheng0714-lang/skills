@@ -26,6 +26,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -80,17 +81,28 @@ const (
 	outboxMaxBackoff   = 5 * time.Minute
 	outboxStaleAfter   = 15 * time.Minute
 	outboxBacklogLimit = 1000
-	// 一个进程最近一分钟最多新增这么多行请求日志，多的丢掉（防扫描器刷满日志表：飞书一张表最多两三万到五万行）。
-	requestRowsPerMinute = 200
-	droppedWarnFor       = 15 * time.Minute
+	// 一个进程最近一分钟最多新增这么多行请求日志、登录失败日志，多的丢掉（防扫描器刷满日志表：飞书一张表最多两三万到五万行）。
+	// 登录失败不用登录就能造出来，额度单独算、比请求少。
+	requestRowsPerMinute   = 200
+	loginFailRowsPerMinute = 30
+	droppedWarnFor         = 15 * time.Minute
+	// 一样的日志行（请求：方法、路径、状态码、人；登录失败：方式、IP、账号、原因）10 秒内最多新起一行，
+	// 这期间再来的攒进那一行的「次数」，到点再写出去。
+	logMergeWindow = 10 * time.Second
 
-	// 日志表留多少行（2026-10-16 用户同意请求日志「只留最新的」）：每写 500 行查一次总行数，
-	// 超了就删最旧的「请求」行，删到上限的 90%；登录、退出、被收回的行永远不删。
+	// 日志表留多少行（2026-10-16 用户同意请求日志「只留最新的」）：每写 500 行查一次总行数，超了按时间从旧到新删，
+	// 删到上限的 90%：先删「登录失败」，不够再删「请求」，还不够才删别的（登录成功、退出、被收回），表永远不会满到写不进去。
 	defaultLogMaxRows = 45_000
 	logTrimEvery      = 500
 
-	// 账号表变更提醒：同一行同时只处理一次，全局每分钟最多处理这么多次（伪造的提醒再多也只多读几次表）。
+	// 账号表变更提醒：同一行同时只处理一次，全局每分钟最多处理这么多次（处理完再来一遍也算一次），
+	// 伪造的提醒再多也只多读几次表；提醒顺带的表结构检查最多每分钟一次（兜底对账每轮照查）。
 	accountsChangedPerMinute = 60
+	schemaEventGap           = time.Minute
+
+	// 账号密码登录限速（每次登录都要当场查一次账号表）：每个 IP 每分钟最多 10 次，整个进程每分钟最多查 60 次表，超了回 429。
+	accountLoginsPerIP      = 10
+	accountLookupsPerMinute = 60
 )
 
 // 账号密码登录的人没有集成平台身份，company_code 记成这个，和 FBIF、富的分开。
@@ -140,6 +152,10 @@ const (
 
 	targetLog      = "log"
 	targetAccounts = "accounts"
+
+	// 可合并的日志行分两类，各有每分钟的额度（合并键的第一段）。
+	rowRequest   = "request"
+	rowLoginFail = "login_fail"
 )
 
 // 多维表格字段类型。
@@ -300,18 +316,24 @@ type SSO struct {
 	failMu sync.Mutex
 	fails  map[string]*accountFails // 账号 → 连错次数；shortcut: 只在本实例内计数
 
-	changedMu    sync.Mutex
-	changing     map[string]bool // record_id → 还要不要再处理一遍（正在处理时又来了提醒）
-	changedTimes []time.Time     // 最近一分钟处理过的提醒
+	loginsPerIP   *perMinute // 账号密码登录：每个 IP
+	lookups       *perMinute // 账号密码登录：整个进程查账号表的次数
+	changeQuota   *perMinute // 账号表变更提醒：整个进程处理的次数（含处理完再来一遍）
+	changedMu     sync.Mutex
+	changing      map[string]bool // record_id → 还要不要再处理一遍（正在处理时又来了提醒）
+	schemaEventAt time.Time       // 变更提醒上一次顺带查表结构的时间（changedMu 管）
 
 	healthMu       sync.Mutex
 	issues         map[string]map[string]string // "accounts"/"log" → 表结构问题代码 → 说明
 	accountsFailed bool                         // 最近一次读账号表失败了
 }
 
+// accountFails 是一个账号最近 15 分钟的连错次数。inflight 是正在查表、还没出结果的尝试：
+// 查表前先占一次，并发猜密码也凑不出第 6 次。known 是查到过这个账号（日志里才写账号原文）。
 type accountFails struct {
-	n     int
-	first time.Time
+	n, inflight int
+	first       time.Time
+	known       bool
 }
 
 // New 读环境变量：SSO_ISSUER、SSO_CLIENT_ID、SSO_CLIENT_SECRET、SSO_REDIRECT_URL、
@@ -462,6 +484,9 @@ func New(ctx context.Context, opt Options) (*SSO, error) {
 		outbox:         ob,
 		syncWake:       make(chan struct{}, 1),
 		fails:          map[string]*accountFails{},
+		loginsPerIP:    newPerMinute(accountLoginsPerIP),
+		lookups:        newPerMinute(accountLookupsPerMinute),
+		changeQuota:    newPerMinute(accountsChangedPerMinute),
 		issues:         map[string]map[string]string{},
 	}
 	go s.syncLoop()
@@ -500,6 +525,14 @@ func (s *SSO) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+blocklistPath, s.handleBlocklistChanged)
 	mux.HandleFunc("POST "+accountsChangedPath, s.handleAccountsChanged)
 	mux.HandleFunc("GET "+healthPath, s.handleHealth)
+}
+
+// Shutdown 在进程退出前调（http.Server.Shutdown 之后）：把待写队列里还没落盘的改动落盘，重启后接着写。
+func (s *SSO) Shutdown(ctx context.Context) error {
+	if s.outbox == nil {
+		return nil
+	}
+	return s.outbox.flush(ctx)
 }
 
 // RequireUser 包住所有要登录的接口，包括下载、导出、长连接。没登录回 401。
@@ -1143,8 +1176,8 @@ func oauthErr(err error) string {
 // ---------- 账号密码 ----------
 
 // handleAccountLogin 给没有飞书的外部供应商、兼职：POST JSON {username, password}，当场查一次账号表。
-// 成功 200 并下发同一个会话 cookie；不让进一律 401 auth_failed（真实原因只写日志）；连错太多 429 rate_limited；
-// 账号表查不了 503 login_service_unavailable（不放人，也不算连错）。
+// 成功 200 并下发同一个会话 cookie；不让进一律 401 auth_failed（真实原因只写日志）；
+// 连错太多、同时猜太多次、请求太频繁 429 rate_limited；账号表查不了或列有问题 503 login_service_unavailable（不放人，也不算连错）。
 func (s *SSO) handleAccountLogin(w http.ResponseWriter, r *http.Request) {
 	// 只收 JSON：跨站页面不经预检发不出这个类型，别人没法悄悄把你登进他的账号。
 	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt != "application/json" {
@@ -1159,29 +1192,54 @@ func (s *SSO) handleAccountLogin(w http.ResponseWriter, r *http.Request) {
 	name := normalizeUsername(in.Username)
 	// 密码前后不会有空白；转发时常多带一个空格或换行。
 	password := strings.TrimSpace(in.Password)
+	typed := strings.TrimSpace(in.Username)
 	ev := requestEvent(r, methodAccount)
-	ev.Account = clip(strings.TrimSpace(in.Username), 100)
-	if !s.allowAttempt(name) {
-		ev.Event, ev.Reason = eventLoginFail, "已锁定"
+	// 还不知道有没有这个账号：先打码（常有人把密码填进账号栏），表里查到了才写原文。
+	ev.Account = maskAccount(typed)
+	deny := func(status int, code, reason string) {
+		log.Printf("sso: account login %q refused: %s", ev.Account, reason)
+		ev.Event, ev.Reason = eventLoginFail, reason
 		s.record(ev)
-		writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": "rate_limited"})
+		writeJSON(w, status, map[string]any{"error": code})
+	}
+	if !s.loginsPerIP.allow(ev.IP) {
+		deny(http.StatusTooManyRequests, "rate_limited", "请求太频繁")
 		return
 	}
+	known, ok, locked := s.reserveAttempt(name)
+	if known {
+		ev.Account = clip(typed, 100)
+	}
+	if !ok {
+		reason := "同时尝试太多次"
+		if locked {
+			reason = "已锁定"
+		}
+		deny(http.StatusTooManyRequests, "rate_limited", reason)
+		return
+	}
+	// 查表前占了一次尝试；没出结果（查不了表、限速）就退回去，不算连错。
+	settled := false
+	defer func() {
+		if !settled {
+			s.releaseAttempt(name)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(r.Context(), upstreamLimit)
+	defer cancel()
+	columnsOK := s.columnsCheck(ctx)
 	var found []accountRow // 按账号查到的行，拒绝时把它们的「状态」一起对一遍
 	refuse := func(row *accountRow, reason string) {
-		_, locked := s.recordFailure(name)
+		settled = true
 		// 凑满 5 次时 writeStatuses 会把这一行写成「已锁定」和解锁时间。
-		s.writeStatuses(found)
-		if locked {
+		if s.failAttempt(name, len(found) > 0) {
 			reason += "（连错 5 次，已锁定）"
 		}
+		s.writeStatuses(found, columnsOK)
 		if row != nil {
 			ev.RecordID = row.ID
 		}
-		log.Printf("sso: account login %q refused: %s", name, reason)
-		ev.Event, ev.Reason = eventLoginFail, reason
-		s.record(ev)
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "auth_failed"})
+		deny(http.StatusUnauthorized, "auth_failed", reason)
 	}
 	switch {
 	case s.accountsTable == nil:
@@ -1194,22 +1252,35 @@ func (s *SSO) handleAccountLogin(w http.ResponseWriter, r *http.Request) {
 		refuse(nil, "没填密码")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), upstreamLimit)
-	defer cancel()
-	rows, err := s.findAccount(ctx, name)
-	found = rows
-	if err != nil {
-		log.Printf("sso: account login %q: accounts table: %v", name, err)
-		ev.Event, ev.Reason = eventLoginFail, "查表失败"
-		s.record(ev)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "login_service_unavailable"})
+	if !s.lookups.allow("") {
+		deny(http.StatusTooManyRequests, "rate_limited", "请求太频繁")
 		return
 	}
-	row, reason := s.loginVerdict(rows, password)
+	// 账号表的列有问题（改了列名、类型）时读回来的空值不能当真：按查不了表处理。
+	if s.accountColumnsBroken() && !columnsOK() {
+		deny(http.StatusServiceUnavailable, "login_service_unavailable", "查表失败：账号表的列有问题")
+		return
+	}
+	rows, err := s.findAccount(ctx, name)
+	if err != nil {
+		log.Printf("sso: account login %q: accounts table: %v", ev.Account, err)
+		deny(http.StatusServiceUnavailable, "login_service_unavailable", "查表失败")
+		return
+	}
+	found = rows
+	if len(rows) > 0 {
+		ev.Account = clip(typed, 100)
+	}
+	row, reason, fromColumns := s.loginVerdict(rows, password)
+	if fromColumns && !columnsOK() {
+		deny(http.StatusServiceUnavailable, "login_service_unavailable", "查表失败：账号表的列有问题")
+		return
+	}
 	if reason != "" {
 		refuse(row, reason)
 		return
 	}
+	settled = true
 	s.clearFailures(name)
 	id := Identity{CompanyCode: accountCompanyCode, Sub: row.ID, Name: strings.TrimSpace(row.Username)}
 	ev = withIdentity(ev, id)
@@ -1220,9 +1291,7 @@ func (s *SSO) handleAccountLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if err != nil {
 		log.Printf("sso: OnLogin %s: %v", id.Key(), err)
-		ev.Event, ev.Reason = eventLoginFail, "OnLogin 出错"
-		s.record(ev)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "login_service_unavailable"})
+		deny(http.StatusServiceUnavailable, "login_service_unavailable", "OnLogin 出错")
 		return
 	}
 	sid := randToken()
@@ -1231,9 +1300,7 @@ func (s *SSO) handleAccountLogin(w http.ResponseWriter, r *http.Request) {
 		Account: true, AccountCredential: s.credential(row.Password), Features: s.checkedFeatures(*row)}
 	if err := s.store.CreateSession(ctx, sess); err != nil {
 		log.Printf("sso: create session: %v", err)
-		ev.Event, ev.Reason = eventLoginFail, "建会话失败"
-		s.record(ev)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "login_service_unavailable"})
+		deny(http.StatusServiceUnavailable, "login_service_unavailable", "建会话失败")
 		return
 	}
 	setCookie(w, sessionCookie, sid, sessionIdle+touchEvery)
@@ -1244,26 +1311,36 @@ func (s *SSO) handleAccountLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// maskAccount 是没在表里查到的账号写进日志的样子：只留开头一两个字，后面打码、写出总长（常有人把密码填进账号栏）。
+func maskAccount(typed string) string {
+	r := []rune(typed)
+	if len(r) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s***（%d 字）", string(r[:min(2, len(r)/2)]), len(r))
+}
+
 // loginVerdict 判这次账号登录：返回对上的那一行，不让进时返回原因（只写日志，不回给浏览器）。
-func (s *SSO) loginVerdict(rows []accountRow, password string) (*accountRow, string) {
+// fromColumns 是这个原因来自可能被改了名的列（缺密码、账号状态不是启用），当真之前要先确认列没问题。
+func (s *SSO) loginVerdict(rows []accountRow, password string) (*accountRow, string, bool) {
 	switch {
 	case len(rows) == 0:
-		return nil, "账号不存在"
+		return nil, "账号不存在", false
 	case len(rows) > 1:
-		return nil, "账号重复"
+		return nil, "账号重复", false
 	}
 	row := &rows[0]
 	stored := strings.TrimSpace(row.Password)
 	if stored == "" {
-		return row, "配置有误：缺密码"
+		return row, "配置有误：缺密码", true
 	}
 	if !s.samePassword(stored, password) {
-		return row, "密码不对"
+		return row, "密码不对", false
 	}
 	if row.Enabled != enabledValue {
-		return row, enabledRefusal(row.Enabled)
+		return row, enabledRefusal(row.Enabled), true
 	}
-	return row, ""
+	return row, "", false
 }
 
 // enabledRefusal 是「账号状态」不是启用时的原因：只有一字不差的「启用」能登录，空的、禁用、改了名的选项都不行。
@@ -1284,31 +1361,63 @@ func (s *SSO) credential(password string) string {
 	return hex.EncodeToString(hmacSum(s.credKey, strings.TrimSpace(password)))[:16]
 }
 
-func (s *SSO) allowAttempt(name string) bool {
-	s.failMu.Lock()
-	defer s.failMu.Unlock()
-	f := s.fails[name]
-	return f == nil || f.n < accountFailLimit || time.Since(f.first) > accountLockFor
-}
-
-// recordFailure 记一次失败；这一次正好凑满 5 次时返回解锁时间和 true。
-func (s *SSO) recordFailure(name string) (time.Time, bool) {
-	s.failMu.Lock()
-	defer s.failMu.Unlock()
+// failsOf 取一个账号这 15 分钟的记录（过了 15 分钟从零算，正在查的照留）。调用方持有 failMu。
+func (s *SSO) failsOf(name string) *accountFails {
 	if len(s.fails) > 10_000 {
 		for k, f := range s.fails {
-			if time.Since(f.first) > accountLockFor {
+			if f.inflight == 0 && time.Since(f.first) > accountLockFor {
 				delete(s.fails, k)
 			}
 		}
 	}
 	f := s.fails[name]
 	if f == nil || time.Since(f.first) > accountLockFor {
-		f = &accountFails{first: time.Now()}
+		next := &accountFails{first: time.Now()}
+		if f != nil {
+			next.inflight, next.known = f.inflight, f.known
+		}
+		f = next
 		s.fails[name] = f
 	}
+	return f
+}
+
+// reserveAttempt 查表前在同一把锁里先占一次尝试：连错次数加上正在查的凑满 5 次就不让查，并发猜密码也凑不出第 6 次。
+// locked 是已经连错满 5 次；known 是之前在表里查到过这个账号。
+func (s *SSO) reserveAttempt(name string) (known, ok, locked bool) {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	f := s.failsOf(name)
+	if f.n >= accountFailLimit {
+		return f.known, false, true
+	}
+	if f.n+f.inflight >= accountFailLimit {
+		return f.known, false, false
+	}
+	f.inflight++
+	return f.known, true, false
+}
+
+// releaseAttempt 退回占着的一次（查不了表、被限速，不算连错）。
+func (s *SSO) releaseAttempt(name string) {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	if f := s.fails[name]; f != nil && f.inflight > 0 {
+		f.inflight--
+	}
+}
+
+// failAttempt 把占着的一次记成失败；这一次正好凑满 5 次时返回 true。
+func (s *SSO) failAttempt(name string, known bool) bool {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	f := s.failsOf(name)
+	if f.inflight > 0 {
+		f.inflight--
+	}
 	f.n++
-	return f.first.Add(accountLockFor), f.n == accountFailLimit
+	f.known = f.known || known
+	return f.n == accountFailLimit
 }
 
 func (s *SSO) clearFailures(name string) {
@@ -1379,9 +1488,18 @@ func (s *SSO) checkAccount(ctx context.Context, r *http.Request, sess *Session) 
 		return nil, http.StatusServiceUnavailable
 	}
 	s.accountsRead(nil)
-	s.retryAfter.Delete(cur.IDHash)
 	row := parseAccountRow(rec)
-	if reason := s.revokeReason(row, cur.AccountCredential); reason != "" {
+	reason := s.revokeReason(row, cur.AccountCredential)
+	// 停用、改密码都是看列读出来的：列被改了名读回空值，不能拿它踢人，按读不到表处理。
+	if reason != "" && !s.columnsCheck(cctx)() {
+		s.retryAfter.Store(cur.IDHash, time.Now().Add(outageBackoff))
+		if inGrace {
+			return cur, http.StatusOK
+		}
+		return nil, http.StatusServiceUnavailable
+	}
+	s.retryAfter.Delete(cur.IDHash)
+	if reason != "" {
 		log.Printf("sso: account %s %s, ending session", cur.Identity.Sub, reason)
 		s.revokeSession(ctx, r, cur.IDHash, reason)
 		return nil, http.StatusUnauthorized
@@ -1532,6 +1650,11 @@ func (s *SSO) reconcileOnce() bool {
 	if s.accountsTable == nil {
 		return true
 	}
+	// 账号表的列有问题时读出来的值不能当真（停用、改密码都会误判）：这一轮什么都不做，退避后再查。
+	if s.accountColumnsBroken() {
+		log.Printf("sso: reconcile: accounts table columns broken, not touching sessions")
+		return false
+	}
 	readAt := time.Now()
 	recs, err := s.feishu.search(ctx, *s.accountsTable, nil, nil, 200)
 	s.accountsRead(err)
@@ -1552,6 +1675,7 @@ func (s *SSO) reconcileOnce() bool {
 		key := normalizeUsername(row.Username)
 		groups[key] = append(groups[key], row)
 	}
+	columnsOK := s.columnsCheck(ctx)
 	ended := 0
 	for _, sess := range sessions {
 		// 读表之后才登录或核对过的会话不动：它比这份表新。
@@ -1562,12 +1686,12 @@ func (s *SSO) reconcileOnce() bool {
 		if r, ok := rows[sess.Identity.Sub]; ok {
 			row = &r
 		}
-		if !s.settleAccountSession(ctx, sess, row) {
+		if !s.settleAccountSession(ctx, sess, row, columnsOK) {
 			ended++
 		}
 	}
 	for _, g := range groups {
-		s.writeStatuses(g)
+		s.writeStatuses(g, columnsOK)
 	}
 	log.Printf("sso: reconcile: %d account rows, %d sessions checked, %d ended", len(recs), len(sessions), ended)
 	return true
@@ -1576,15 +1700,8 @@ func (s *SSO) reconcileOnce() bool {
 // checkSchema 查两张表的列，换上新的表结构问题；有一张读不到返回 false。
 func (s *SSO) checkSchema(ctx context.Context) bool {
 	ok := true
-	if s.accountsTable != nil {
-		fields, err := s.feishu.fields(ctx, *s.accountsTable)
-		s.accountsRead(err)
-		if err != nil {
-			log.Printf("sso: accounts table fields: %v", err)
-			ok = false
-		} else {
-			s.setIssues(targetAccounts, accountSchemaIssues(fields, s.features))
-		}
+	if s.accountsTable != nil && !s.checkAccountColumns(ctx) {
+		ok = false
 	}
 	if s.logTable != nil {
 		if fields, err := s.feishu.fields(ctx, *s.logTable); err != nil {
@@ -1597,17 +1714,68 @@ func (s *SSO) checkSchema(ctx context.Context) bool {
 	return ok
 }
 
-// writeStatuses 把同一个账号名的几行的「状态」「状态说明」算一遍，对不上的写回。
-func (s *SSO) writeStatuses(rows []accountRow) {
+// checkAccountColumns 查一次账号表的列，换上新的问题；读不到返回 false。
+func (s *SSO) checkAccountColumns(ctx context.Context) bool {
+	fields, err := s.feishu.fields(ctx, *s.accountsTable)
+	s.accountsRead(err)
+	if err != nil {
+		log.Printf("sso: accounts table fields: %v", err)
+		return false
+	}
+	s.setIssues(targetAccounts, accountSchemaIssues(fields, s.features))
+	return true
+}
+
+// accountColumnsBroken 是上次查到账号表系统要读写的列有问题（accounts_column:*，不含功能列）。
+func (s *SSO) accountColumnsBroken() bool {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	for code := range s.issues[targetAccounts] {
+		if strings.HasPrefix(code, "accounts_column:") {
+			return true
+		}
+	}
+	return false
+}
+
+// columnsCheck 给一次操作用：第一次调用时当场查一次账号表的列，之后返回同一个结果。列读得到、没问题才是 true。
+// 要按读出来的值踢人、拒绝登录、改「状态」之前调它：管理员改了列名，读回来的空值会被当成停用或改了密码。
+func (s *SSO) columnsCheck(ctx context.Context) func() bool {
+	var once sync.Once
+	ok := false
+	return func() bool {
+		once.Do(func() { ok = s.checkAccountColumns(ctx) && !s.accountColumnsBroken() })
+		return ok
+	}
+}
+
+// writeStatuses 把同一个账号名的几行的「状态」「状态说明」算一遍，对不上的写回；要写之前先确认账号表的列没问题。
+func (s *SSO) writeStatuses(rows []accountRow, columnsOK func() bool) {
 	locked := s.lockedNames()
+	changes := map[string]map[string]any{}
 	for _, row := range rows {
 		if row.blank() {
 			continue
 		}
 		status, note := accountRowStatus(rowFacts{row: row, duplicate: len(rows) > 1, lockedUntil: locked[normalizeUsername(row.Username)]})
-		if status != row.Status || note != row.Note {
-			s.writeBack(row.ID, map[string]any{colStatus: status, colNote: note})
+		// 表里读到的是还没写成的写回之前的值：叠上队列里这一行还没写成的，才知道要不要再写。
+		cur, curNote := row.Status, row.Note
+		pending := s.outbox.pendingAccount(row.ID)
+		if v, ok := pending[colStatus].(string); ok {
+			cur = v
 		}
+		if v, ok := pending[colNote].(string); ok {
+			curNote = v
+		}
+		if status != cur || note != curNote {
+			changes[row.ID] = map[string]any{colStatus: status, colNote: note}
+		}
+	}
+	if len(changes) == 0 || !columnsOK() {
+		return
+	}
+	for id, fields := range changes {
+		s.writeBack(id, fields)
 	}
 }
 
@@ -1635,21 +1803,19 @@ func (s *SSO) claimChange(id string) bool {
 		s.changing[id] = true
 		return false
 	}
-	now := time.Now()
-	s.changedTimes = slices.DeleteFunc(s.changedTimes, func(t time.Time) bool { return now.Sub(t) > time.Minute })
-	if len(s.changedTimes) >= accountsChangedPerMinute {
+	if !s.changeQuota.allow("") {
 		return false
 	}
-	s.changedTimes = append(s.changedTimes, now)
 	s.changing[id] = false
 	return true
 }
 
+// processChanges 处理一行；处理期间又来了提醒就再来一遍，再来的这一遍也占每分钟 60 次的名额，没名额就不来了。
 func (s *SSO) processChanges(id string) {
 	for {
 		s.applyAccountChange(id)
 		s.changedMu.Lock()
-		if !s.changing[id] {
+		if !s.changing[id] || !s.changeQuota.allow("") {
 			delete(s.changing, id)
 			s.changedMu.Unlock()
 			return
@@ -1659,12 +1825,25 @@ func (s *SSO) processChanges(id string) {
 	}
 }
 
+// eventSchemaDue 是变更提醒这一次要不要顺带查表结构：最多每分钟一次。
+func (s *SSO) eventSchemaDue() bool {
+	s.changedMu.Lock()
+	defer s.changedMu.Unlock()
+	if time.Since(s.schemaEventAt) < schemaEventGap {
+		return false
+	}
+	s.schemaEventAt = time.Now()
+	return true
+}
+
 // applyAccountChange 读那一行：删了、账号状态不是启用、密码改了，就让绑在这一行上的会话全部下线；
 // 否则更新名字和功能。最后把同名几行的「状态」对一遍。不认识的 record_id 什么都不做。
 func (s *SSO) applyAccountChange(id string) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	s.checkSchema(ctx)
+	if s.eventSchemaDue() {
+		s.checkSchema(ctx)
+	}
 	rec, err := s.feishu.get(ctx, *s.accountsTable, id)
 	s.accountsRead(err)
 	if err != nil && !errors.Is(err, errRecordNotFound) {
@@ -1680,9 +1859,10 @@ func (s *SSO) applyAccountChange(id string) {
 		r := parseAccountRow(rec)
 		row = &r
 	}
+	columnsOK := s.columnsCheck(ctx)
 	for _, sess := range sessions {
 		if sess.Identity.Sub == id {
-			s.settleAccountSession(ctx, sess, row)
+			s.settleAccountSession(ctx, sess, row, columnsOK)
 		}
 	}
 	if row == nil {
@@ -1698,15 +1878,19 @@ func (s *SSO) applyAccountChange(id string) {
 			}
 		}
 	}
-	s.writeStatuses(group)
+	s.writeStatuses(group, columnsOK)
 }
 
 // settleAccountSession 按刚读到的那一行处理一个账号会话（row 为 nil 是那一行删了）：
 // 删了、账号状态不是启用、密码改了就下线，返回 false；否则更新名字和功能，返回 true。
-func (s *SSO) settleAccountSession(ctx context.Context, sess Session, row *accountRow) bool {
+// 停用、改密码是看列读出来的，账号表的列有问题时不当真、不下线。
+func (s *SSO) settleAccountSession(ctx context.Context, sess Session, row *accountRow, columnsOK func() bool) bool {
 	reason := "账号已删除"
 	if row != nil {
 		reason = s.revokeReason(*row, sess.AccountCredential)
+		if reason != "" && !columnsOK() {
+			return true
+		}
 	}
 	if reason != "" {
 		log.Printf("sso: account %s %s, ending session", sess.Identity.Sub, reason)
@@ -1841,15 +2025,18 @@ func (s *SSO) handleHealth(w http.ResponseWriter, r *http.Request) {
 		problems = append(problems, "accounts_unreachable")
 	}
 	s.healthMu.Unlock()
-	pending, oldest, dropped := 0, 0, int64(0)
+	pending, oldest := 0, 0
+	dropped := map[string]int64{}
 	if s.outbox != nil {
 		st := s.outbox.stats()
 		pending, dropped = st.pending, st.dropped
 		if !st.oldest.IsZero() {
 			oldest = int(time.Since(st.oldest).Seconds())
 		}
-		if !st.droppedAt.IsZero() && time.Since(st.droppedAt) < droppedWarnFor {
-			problems = append(problems, "warn_request_rows_dropped")
+		for class, warn := range map[string]string{rowRequest: "warn_request_rows_dropped", rowLoginFail: "warn_login_rows_dropped"} {
+			if at := st.droppedAt[class]; !at.IsZero() && time.Since(at) < droppedWarnFor {
+				problems = append(problems, warn)
+			}
 		}
 		if time.Duration(oldest)*time.Second > outboxStaleAfter {
 			problems = append(problems, "outbox_stale")
@@ -1867,7 +2054,8 @@ func (s *SSO) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		status = http.StatusServiceUnavailable
 	}
-	writeJSON(w, status, map[string]any{"ok": ok, "outbox_pending": pending, "oldest_pending_seconds": oldest, "dropped_request_rows": dropped, "problems": problems})
+	writeJSON(w, status, map[string]any{"ok": ok, "outbox_pending": pending, "oldest_pending_seconds": oldest,
+		"dropped_request_rows": dropped[rowRequest], "dropped_login_rows": dropped[rowLoginFail], "problems": problems})
 }
 
 // ---------- 登录日志 ----------
@@ -1882,7 +2070,7 @@ type loginEvent struct {
 	Verb, Path string
 	Status     int
 	DurationMS int64
-	mergeKey   string // 同一窗口里方法、路径、状态码、人（没登录按 IP）都一样的请求合成一行
+	mergeKey   string // 一样的行合成一行：请求按方法、路径、状态码、人（没登录按 IP），登录失败按方式、IP、账号、原因
 }
 
 func requestEvent(r *http.Request, method string) loginEvent {
@@ -1957,6 +2145,10 @@ func (s *SSO) record(e loginEvent) {
 		return
 	}
 	typ, result := e.typeAndResult()
+	if e.Event == eventLoginFail {
+		// 不用登录就能造出来的行：一样的合成一行记次数，再按额度限量，不能拿它刷满共用的日志表。
+		e.mergeKey = strings.Join([]string{rowLoginFail, e.Method, e.IP, e.Account, e.Reason}, "\x00")
+	}
 	f := map[string]any{"摘要": clip(e.summary(), 200), "时间": time.Now().UnixMilli(), "项目": []string{s.projectRec}, "类型": typ, "次数": 1}
 	if result != "" {
 		f["结果"] = result
@@ -2068,7 +2260,7 @@ func (s *SSO) logRequest(r *http.Request, note *requestNote, status int, took ti
 			ev = s.sessionEvent(ev, sess, eventRequest, ev.Reason)
 			who = sess.Identity.Key()
 		}
-		ev.mergeKey = strings.Join([]string{ev.Verb, ev.Path, strconv.Itoa(status), who}, "\x00")
+		ev.mergeKey = strings.Join([]string{rowRequest, ev.Verb, ev.Path, strconv.Itoa(status), who}, "\x00")
 		s.record(ev)
 	}()
 }
@@ -2116,17 +2308,20 @@ func cmpOrInt(v, fallback int) int {
 	return fallback
 }
 
-// clientIP 依次认 X-Real-IP、X-Forwarded-For 第一个、直连地址，并记下用的是哪个。
+// clientIP 取访客 IP，并记下用的是哪个。直连的是本机或内网（就是前面的反向代理）时，认 X-Forwarded-For 最右边那个：
+// 那是反向代理自己加的（Caddy 默认不信访客传来的 X-Forwarded-For、换成真实地址；nginx 的 $proxy_add_x_forwarded_for
+// 把真实地址追加在最后），左边的都可能是访客自己写的。X-Real-IP 不认：Caddy 原样转发访客传来的值，谁都能伪造。
+// 直连的是公网地址（前面没有反向代理），这些头一概不认，用直连地址。前面还有一层 CDN 时记到的是 CDN 的地址。
 func clientIP(r *http.Request) (string, string) {
-	if v := strings.TrimSpace(r.Header.Get("X-Real-IP")); v != "" {
-		return v, "X-Real-IP"
-	}
-	if first, _, _ := strings.Cut(r.Header.Get("X-Forwarded-For"), ","); strings.TrimSpace(first) != "" {
-		return strings.TrimSpace(first), "X-Forwarded-For"
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
+	}
+	if peer, err := netip.ParseAddr(host); err == nil && (peer.Unmap().IsLoopback() || peer.Unmap().IsPrivate()) {
+		hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+		if last := strings.TrimSpace(hops[len(hops)-1]); last != "" {
+			return clip(last, 100), "X-Forwarded-For"
+		}
 	}
 	return host, "RemoteAddr"
 }
@@ -2175,6 +2370,39 @@ func (s *SSO) open(purpose, sealed string) ([]byte, error) {
 	}
 	n := s.aead.NonceSize()
 	return s.aead.Open(nil, raw[:n], raw[n:], []byte(purpose))
+}
+
+// perMinute 数每个 key 最近一分钟放行了几次，到了上限就不放（key 用 "" 就是全局一个数）。
+type perMinute struct {
+	limit  int
+	mu     sync.Mutex
+	hits   map[string][]time.Time
+	pruned time.Time
+}
+
+func newPerMinute(limit int) *perMinute {
+	return &perMinute{limit: limit, hits: map[string][]time.Time{}}
+}
+
+func (p *perMinute) allow(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	if now.Sub(p.pruned) > time.Minute {
+		for k, ts := range p.hits {
+			if now.Sub(ts[len(ts)-1]) > time.Minute {
+				delete(p.hits, k)
+			}
+		}
+		p.pruned = now
+	}
+	ts := slices.DeleteFunc(p.hits[key], func(t time.Time) bool { return now.Sub(t) > time.Minute })
+	if len(ts) >= p.limit {
+		p.hits[key] = ts
+		return false
+	}
+	p.hits[key] = append(ts, now)
+	return true
 }
 
 func hmacSum(key []byte, msg string) []byte {
@@ -2719,9 +2947,10 @@ func cellText(v any) string {
 
 // ---------- 待写队列 ----------
 
-// outbox 是写日志表、写回账号表的持久队列：每次去写之前先 fsync 落盘，写成了才删；重启接着写。
-// 登录和请求从不等它（落盘也在后台），写不进去只在健康检查里报。同一行的写回合并成一条（后写的值为准），
-// 还没写出去的一样的请求日志合成一行（次数加一、耗时取最大）。
+// outbox 是写日志表、写回账号表的持久队列：每次去写之前一定已落盘，写成了才删；重启接着写。
+// 登录和请求从不等它：进队列只在锁里改内存，落盘在后台（锁外写文件、fsync），写不进去只在健康检查里报。
+// 同一行的写回合成一条（后写的值为准）；一样的请求、登录失败合成一行（次数加一），10 秒内同一键最多新起一行，
+// 两类各有每分钟的额度。
 type outbox struct {
 	path     string
 	mu       sync.Mutex
@@ -2732,11 +2961,21 @@ type outbox struct {
 	kick     map[string]chan struct{} // 兜底对账叫醒在退避里等着的写入
 	dirty    chan struct{}
 	saveErr  bool
+	gen      int64         // 队列改过几次
+	savedGen int64         // 最近一次落盘（成没成功都算）包含了前多少次改动
+	savedCh  chan struct{} // 每落一次盘就关掉换新的，flush 在上面等
 
-	requestTimes []time.Time // 最近一分钟新增的请求日志行
-	dropping     bool        // 正在丢请求日志（只在开始丢时记一行 stderr）
-	dropped      int64
-	droppedAt    time.Time
+	recent   map[string]time.Time  // 合并键 → 这一键最近一行写出去的时间（暂存的那行算到点的时间）
+	prunedAt time.Time             // recent 上次清理的时间
+	budgets  map[string]*rowBudget // rowRequest / rowLoginFail → 每分钟额度
+}
+
+// rowBudget 是一类可合并日志行每分钟新增的额度，丢了多少给健康检查看。
+type rowBudget struct {
+	limit     *perMinute
+	dropping  bool // 正在丢（只在开始丢时记一行 stderr）
+	dropped   int64
+	droppedAt time.Time
 }
 
 type outboxItem struct {
@@ -2746,10 +2985,13 @@ type outboxItem struct {
 	Merge    string         `json:"merge,omitempty"`
 	Fields   map[string]any `json:"fields"`
 	At       time.Time      `json:"at"`
+	Hold     time.Time      `json:"hold"` // 同一键 10 秒内已写出过一行：到这个时间才写，期间再来的并进来
 }
 
 func openOutbox(path string, targets []string) (*outbox, error) {
-	ob := &outbox{path: path, items: []outboxItem{}, inflight: map[int64]bool{}, wake: map[string]chan struct{}{}, kick: map[string]chan struct{}{}, dirty: make(chan struct{}, 1)}
+	ob := &outbox{path: path, items: []outboxItem{}, inflight: map[int64]bool{}, wake: map[string]chan struct{}{}, kick: map[string]chan struct{}{},
+		dirty: make(chan struct{}, 1), savedCh: make(chan struct{}), recent: map[string]time.Time{},
+		budgets: map[string]*rowBudget{rowRequest: {limit: newPerMinute(requestRowsPerMinute)}, rowLoginFail: {limit: newPerMinute(loginFailRowsPerMinute)}}}
 	for _, t := range targets {
 		ob.wake[t] = make(chan struct{}, 1)
 		ob.kick[t] = make(chan struct{}, 1)
@@ -2779,7 +3021,7 @@ func openOutbox(path string, targets []string) (*outbox, error) {
 			log.Printf("sso: outbox dropped %d entries for a table that is no longer configured", dropped)
 		}
 	}
-	if err := ob.save(); err != nil {
+	if err := ob.saveNow(); err != nil {
 		return nil, fmt.Errorf("sso: SSO_OUTBOX_FILE: %w", err)
 	}
 	for _, t := range targets {
@@ -2802,11 +3044,20 @@ func (ob *outbox) kickBacklog() {
 	}
 }
 
+// changed 记一次改动并叫后台落盘。调用方持有 mu。
+func (ob *outbox) changed() {
+	ob.gen++
+	select {
+	case ob.dirty <- struct{}{}:
+	default:
+	}
+}
+
 func (ob *outbox) add(it outboxItem) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 	if !ob.merge(it) {
-		if it.Merge != "" && !ob.allowRequestRow() {
+		if it.Merge != "" && !ob.admit(&it) {
 			return
 		}
 		ob.seq++
@@ -2814,17 +3065,14 @@ func (ob *outbox) add(it outboxItem) {
 		ob.items = append(ob.items, it)
 		ob.trimLogs()
 	}
-	select {
-	case ob.dirty <- struct{}{}:
-	default:
-	}
+	ob.changed()
 	select {
 	case ob.wake[it.Target] <- struct{}{}:
 	default:
 	}
 }
 
-// merge 把这一条并进队列里还没写出去的同一条：账号表同一行后写的值为准；一样的请求日志次数加一、耗时取最大，时间留第一次的。
+// merge 把这一条并进队列里还没写出去的同一条：账号表同一行后写的值为准；一样的日志行次数加一、耗时取最大，时间留第一次的。
 func (ob *outbox) merge(it outboxItem) bool {
 	for i := range ob.items {
 		e := &ob.items[i]
@@ -2837,29 +3085,49 @@ func (ob *outbox) merge(it outboxItem) bool {
 			return true
 		case it.Merge != "" && e.Merge == it.Merge:
 			e.Fields["次数"] = asInt(e.Fields["次数"]) + 1
-			e.Fields["耗时毫秒"] = max(asInt(e.Fields["耗时毫秒"]), asInt(it.Fields["耗时毫秒"]))
+			if _, ok := it.Fields["耗时毫秒"]; ok {
+				e.Fields["耗时毫秒"] = max(asInt(e.Fields["耗时毫秒"]), asInt(it.Fields["耗时毫秒"]))
+			}
 			return true
 		}
 	}
 	return false
 }
 
-// allowRequestRow 最近一分钟新增的请求日志行到了 200 就丢，开始丢时记一行 stderr，健康检查里看得到丢了多少。
-func (ob *outbox) allowRequestRow() bool {
+// admit 决定一条可合并的日志能不能新起一行：这一类最近一分钟的额度用完就丢（开始丢时记一行 stderr，健康检查看得到丢了多少）；
+// 同一键 10 秒内已写出过一行，这一行先暂存到窗口结束，期间再来的都并进它。调用方持有 mu。
+func (ob *outbox) admit(it *outboxItem) bool {
+	class, _, _ := strings.Cut(it.Merge, "\x00")
+	b := ob.budgets[class]
+	if b == nil {
+		b = ob.budgets[rowRequest]
+	}
 	now := time.Now()
-	ob.requestTimes = slices.DeleteFunc(ob.requestTimes, func(t time.Time) bool { return now.Sub(t) > time.Minute })
-	if len(ob.requestTimes) < requestRowsPerMinute {
-		ob.requestTimes = append(ob.requestTimes, now)
-		ob.dropping = false
-		return true
+	if !b.limit.allow("") {
+		if !b.dropping {
+			log.Printf("sso: more than %d %s log rows in a minute, dropping the rest", b.limit.limit, class)
+			b.dropping = true
+		}
+		b.dropped++
+		b.droppedAt = now
+		return false
 	}
-	if !ob.dropping {
-		log.Printf("sso: more than %d request log rows in a minute, dropping the rest", requestRowsPerMinute)
-		ob.dropping = true
+	b.dropping = false
+	if now.Sub(ob.prunedAt) > logMergeWindow {
+		for k, t := range ob.recent {
+			if now.Sub(t) > logMergeWindow {
+				delete(ob.recent, k)
+			}
+		}
+		ob.prunedAt = now
 	}
-	ob.dropped++
-	ob.droppedAt = now
-	return false
+	sendAt := now
+	if last, ok := ob.recent[it.Merge]; ok && now.Sub(last) < logMergeWindow {
+		sendAt = last.Add(logMergeWindow)
+		it.Hold = sendAt
+	}
+	ob.recent[it.Merge] = sendAt
+	return true
 }
 
 func asInt(v any) int64 {
@@ -2897,26 +3165,35 @@ func (ob *outbox) trimLogs() {
 	log.Printf("sso: outbox over %d log rows, dropped the %d oldest", outboxMaxLogs, dropped)
 }
 
-// saveLoop 有改动就在后台落盘，登录和请求不用等 fsync。
+// saveLoop 有改动就在后台落盘；落盘时新来的改动攒着，下一次一起落。
 func (ob *outbox) saveLoop() {
 	for range ob.dirty {
-		ob.mu.Lock()
-		ob.saveLogged()
-		ob.mu.Unlock()
+		ob.saveNow()
 	}
 }
 
-// saveLogged 落盘，只在刚开始失败时记一行 stderr。调用方持有 mu。
-func (ob *outbox) saveLogged() {
+// saveNow 在锁里拍一份快照，放了锁再写临时文件、fsync、改名；只在刚开始失败时记一行 stderr。只有 saveLoop（和启动时）调它，同一时间只有一个在写。
+func (ob *outbox) saveNow() error {
+	ob.mu.Lock()
+	raw, _ := json.Marshal(ob.items)
+	gen := ob.gen
+	ob.mu.Unlock()
+	err := writeSynced(ob.path, raw)
+	ob.mu.Lock()
 	failedBefore := ob.saveErr
-	if err := ob.save(); err != nil && !failedBefore {
+	ob.saveErr = err != nil
+	ob.savedGen = max(ob.savedGen, gen)
+	close(ob.savedCh)
+	ob.savedCh = make(chan struct{})
+	ob.mu.Unlock()
+	if err != nil && !failedBefore {
 		log.Printf("sso: outbox write failed (kept in memory): %v", err)
 	}
+	return err
 }
 
-func (ob *outbox) save() error {
-	raw, _ := json.Marshal(ob.items)
-	tmp := ob.path + ".tmp"
+func writeSynced(path string, raw []byte) error {
+	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err == nil {
 		_, err = f.Write(raw)
@@ -2928,30 +3205,101 @@ func (ob *outbox) save() error {
 		}
 	}
 	if err == nil {
-		err = os.Rename(tmp, ob.path)
+		err = os.Rename(tmp, path)
 	}
-	ob.saveErr = err != nil
 	return err
 }
 
-// take 取一批（最多 500 条）去写，取之前先落盘：写出去之前一定已经在盘上。
-func (ob *outbox) take(target string) []outboxItem {
+// flush 等到此刻之前的改动都落过一次盘（写不进去也算落过：只在健康检查里报，不挡写出去）。
+func (ob *outbox) flush(ctx context.Context) error {
 	ob.mu.Lock()
-	defer ob.mu.Unlock()
-	var batch []outboxItem
-	for _, it := range ob.items {
-		if it.Target == target && !ob.inflight[it.ID] {
-			ob.inflight[it.ID] = true
-			batch = append(batch, outboxItem{ID: it.ID, Target: it.Target, RecordID: it.RecordID, Merge: it.Merge, Fields: maps.Clone(it.Fields), At: it.At})
-			if len(batch) == outboxBatch {
-				break
-			}
+	want := ob.gen
+	ob.mu.Unlock()
+	for {
+		ob.mu.Lock()
+		if ob.savedGen >= want {
+			ob.mu.Unlock()
+			return nil
+		}
+		ch := ob.savedCh
+		select {
+		case ob.dirty <- struct{}{}:
+		default:
+		}
+		ob.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	if len(batch) > 0 {
-		ob.saveLogged()
+}
+
+// take 取一批（最多 500 条）去写；还没到点的暂存行不取，返回最早到点的时间（没有是零值）。
+func (ob *outbox) take(target string) ([]outboxItem, time.Time) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if target == targetAccounts {
+		ob.collapseAccounts()
 	}
-	return batch
+	now := time.Now()
+	var batch []outboxItem
+	var next time.Time
+	for _, it := range ob.items {
+		if it.Target != target || ob.inflight[it.ID] {
+			continue
+		}
+		if it.Hold.After(now) {
+			if next.IsZero() || it.Hold.Before(next) {
+				next = it.Hold
+			}
+			continue
+		}
+		ob.inflight[it.ID] = true
+		batch = append(batch, outboxItem{ID: it.ID, Target: it.Target, RecordID: it.RecordID, Merge: it.Merge, Fields: maps.Clone(it.Fields), At: it.At})
+		if len(batch) == outboxBatch {
+			break
+		}
+	}
+	return batch, next
+}
+
+// collapseAccounts 把还没在写的同一行账号写回并成一条（后写的值为准，时间留早的）：上一批写失败退回来的和这期间新进来的
+// 会是同一行两条，一批里不能有两条同一行，旧值也不能盖掉新值。调用方持有 mu。
+func (ob *outbox) collapseAccounts() {
+	latest := map[string]int{}
+	drop := map[int64]bool{}
+	for i := range ob.items {
+		it := &ob.items[i]
+		if it.Target != targetAccounts || ob.inflight[it.ID] {
+			continue
+		}
+		if j, ok := latest[it.RecordID]; ok {
+			older := ob.items[j]
+			fields := maps.Clone(older.Fields)
+			maps.Copy(fields, it.Fields)
+			it.Fields, it.At = fields, older.At
+			drop[older.ID] = true
+		}
+		latest[it.RecordID] = i
+	}
+	if len(drop) > 0 {
+		ob.items = slices.DeleteFunc(ob.items, func(it outboxItem) bool { return drop[it.ID] })
+		ob.changed()
+	}
+}
+
+// pendingAccount 是账号表这一行还没写成的写回（含正在写的，后写的值为准）。
+func (ob *outbox) pendingAccount(recordID string) map[string]any {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	out := map[string]any{}
+	for _, it := range ob.items {
+		if it.Target == targetAccounts && it.RecordID == recordID {
+			maps.Copy(out, it.Fields)
+		}
+	}
+	return out
 }
 
 func (ob *outbox) finish(batch []outboxItem, delivered bool) {
@@ -2966,21 +3314,24 @@ func (ob *outbox) finish(batch []outboxItem, delivered bool) {
 		return
 	}
 	ob.items = slices.DeleteFunc(ob.items, func(it outboxItem) bool { return done[it.ID] })
-	ob.saveLogged()
+	ob.changed()
 }
 
 type outboxStats struct {
 	pending    int
 	oldest     time.Time
 	saveFailed bool
-	dropped    int64
-	droppedAt  time.Time
+	dropped    map[string]int64     // rowRequest / rowLoginFail → 丢了多少行
+	droppedAt  map[string]time.Time // 最近一次丢的时间
 }
 
 func (ob *outbox) stats() outboxStats {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
-	st := outboxStats{pending: len(ob.items), saveFailed: ob.saveErr, dropped: ob.dropped, droppedAt: ob.droppedAt}
+	st := outboxStats{pending: len(ob.items), saveFailed: ob.saveErr, dropped: map[string]int64{}, droppedAt: map[string]time.Time{}}
+	for class, b := range ob.budgets {
+		st.dropped[class], st.droppedAt[class] = b.dropped, b.droppedAt
+	}
 	for _, it := range ob.items {
 		if st.oldest.IsZero() || it.At.Before(st.oldest) {
 			st.oldest = it.At
@@ -2989,9 +3340,9 @@ func (ob *outbox) stats() outboxStats {
 	return st
 }
 
-// outboxWorker 一张表一个，互不耽误：有东西进来就写，写的时候新进来的攒着下一次一起写；
+// outboxWorker 一张表一个，互不耽误：有东西进来就写，写的时候新进来的攒着下一次一起写；暂存的行到点再写；
 // 失败才按 1 秒起翻倍、最长 5 分钟退避重试（日志表写满了也一样，登录和请求照常）。
-// 日志表每写 500 行查一次总行数，超了按上限删最旧的请求日志；启动时也查一次。
+// 日志表每写 500 行查一次总行数，超了按上限删最旧的；启动时也查一次。
 func (s *SSO) outboxWorker(target string) {
 	backoff := time.Second
 	written := 0
@@ -2999,11 +3350,24 @@ func (s *SSO) outboxWorker(target string) {
 		s.trimLogTable()
 	}
 	for {
-		batch := s.outbox.take(target)
+		batch, next := s.outbox.take(target)
 		if len(batch) == 0 {
-			<-s.outbox.wake[target]
+			if next.IsZero() {
+				<-s.outbox.wake[target]
+			} else {
+				select {
+				case <-s.outbox.wake[target]:
+				case <-time.After(time.Until(next)):
+				}
+			}
 			continue
 		}
+		// 写出去之前一定已在盘上：落盘在后台，这里等它落完这批。
+		fctx, fcancel := context.WithTimeout(context.Background(), upstreamLimit)
+		if err := s.outbox.flush(fctx); err != nil {
+			log.Printf("sso: outbox flush: %v", err)
+		}
+		fcancel()
 		ctx, cancel := context.WithTimeout(context.Background(), upstreamLimit)
 		err := s.deliver(ctx, target, batch)
 		cancel()
@@ -3056,8 +3420,21 @@ func (s *SSO) deliver(ctx context.Context, target string, batch []outboxItem) er
 	return nil
 }
 
-// trimLogTable 日志表总行数超过 SSO_LOG_MAX_ROWS 时，删最旧的「请求」行（不分项目，日志表是共用的），删到上限的 90%；
-// 登录、退出、被收回的行永远不删。失败只记 stderr，下次再说。
+// logTrimOrder 是日志表超了时删的顺序，每一类都按时间从旧到新：先删「登录失败」（不用登录就能造出来），
+// 不够再删「请求」，还不够才删别的（登录成功、退出、被收回），表永远不会被删不掉的行塞满。nil 是不分类型。
+var logTrimOrder = []any{
+	map[string]any{"conjunction": "and", "conditions": []any{
+		map[string]any{"field_name": "类型", "operator": "is", "value": []string{typeLogin}},
+		map[string]any{"field_name": "结果", "operator": "is", "value": []string{resultFail}},
+	}},
+	map[string]any{"conjunction": "and", "conditions": []any{
+		map[string]any{"field_name": "类型", "operator": "is", "value": []string{typeRequest}},
+	}},
+	nil,
+}
+
+// trimLogTable 日志表总行数超过 SSO_LOG_MAX_ROWS 时按 logTrimOrder 删最旧的行（不分项目，日志表是共用的），删到上限的 90%。
+// 失败只记 stderr，下次再说。
 func (s *SSO) trimLogTable() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -3070,29 +3447,30 @@ func (s *SSO) trimLogTable() {
 		return
 	}
 	target := s.logMaxRows * 9 / 10
-	onlyRequests := map[string]any{"conjunction": "and", "conditions": []any{
-		map[string]any{"field_name": "类型", "operator": "is", "value": []string{typeRequest}},
-	}}
 	oldestFirst := []any{map[string]any{"field_name": "时间", "desc": false}}
 	deleted := 0
-	for total > target {
-		recs, err := s.feishu.searchPage(ctx, *s.logTable, onlyRequests, oldestFirst, min(outboxBatch, total-target))
-		if err != nil || len(recs) == 0 {
+trim:
+	for _, filter := range logTrimOrder {
+		for total > target {
+			recs, err := s.feishu.searchPage(ctx, *s.logTable, filter, oldestFirst, min(outboxBatch, total-target))
 			if err != nil {
 				log.Printf("sso: log table trim: %v", err)
+				break trim
 			}
-			break
+			if len(recs) == 0 {
+				break
+			}
+			ids := make([]string, len(recs))
+			for i, rec := range recs {
+				ids[i] = rec.ID
+			}
+			if err := s.feishu.batchDelete(ctx, *s.logTable, ids); err != nil {
+				log.Printf("sso: log table trim: %v", err)
+				break trim
+			}
+			total -= len(ids)
+			deleted += len(ids)
 		}
-		ids := make([]string, len(recs))
-		for i, rec := range recs {
-			ids[i] = rec.ID
-		}
-		if err := s.feishu.batchDelete(ctx, *s.logTable, ids); err != nil {
-			log.Printf("sso: log table trim: %v", err)
-			break
-		}
-		total -= len(ids)
-		deleted += len(ids)
 	}
-	log.Printf("sso: log table over %d rows, deleted the %d oldest request rows", s.logMaxRows, deleted)
+	log.Printf("sso: log table over %d rows, deleted the %d oldest rows", s.logMaxRows, deleted)
 }

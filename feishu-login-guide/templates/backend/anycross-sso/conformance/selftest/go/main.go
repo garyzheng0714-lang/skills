@@ -6,7 +6,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
+	"time"
 
 	"selftest/internal/auth"
 )
@@ -48,5 +51,18 @@ func main() {
 	mux.HandleFunc("GET /api/boom", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
-	log.Fatal(http.ListenAndServe("127.0.0.1:"+os.Getenv("PORT"), sso.Middleware(mux)))
+	srv := &http.Server{Addr: "127.0.0.1:" + os.Getenv("PORT"), Handler: sso.Middleware(mux)}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	// 收到 SIGTERM：先停接新请求，再把待写队列落盘，重启后接着写。
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+	done, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(done)
+	_ = sso.Shutdown(done)
 }

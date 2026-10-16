@@ -36,4 +36,11 @@ app.get('/api/download', sso.requireUser, (req, res) => {
 app.get('/api/boom', (_req, res) => {
   res.status(500).send('boom');
 });
-app.listen(Number(process.env.PORT), '127.0.0.1');
+const server = app.listen(Number(process.env.PORT), '127.0.0.1');
+// 退出前把待写队列落盘：先不再收新请求，再等 sso.shutdown()。
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(sig, () => {
+    server.close();
+    void sso.shutdown().finally(() => process.exit(0));
+  });
+}

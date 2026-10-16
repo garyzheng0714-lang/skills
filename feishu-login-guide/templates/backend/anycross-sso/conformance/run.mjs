@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // 路线 A 合规测试：起一个假的集成平台，把被测项目指过去，像浏览器一样走登录、核对、名单提醒、退出。
 // 用法见 ../README.md「合规测试」。任何语言写的项目都用这一套，上线前跑一遍、结果存档。
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -115,6 +115,10 @@ const acct = {
   bgPw: account('vendor-bg-pw'),
   bgKeep: account('vendor-bg-keep'),
   bgRestart: account('vendor-bg-restart'),
+  // 限速、并发、改列名那几条用
+  race: account('vendor-race'),
+  flood: account('vendor-flood'),
+  col: account('vendor-col'),
 };
 const blankRow = fsk.addRow(ACCT, {});
 // 「事件」是测试里拼出来的简写（登录成功、登录失败、退出、被收回、请求），表里是「类型」+「结果」两列。
@@ -190,7 +194,13 @@ async function stopApp() {
   try {
     process.kill(-app.pid, 'SIGTERM');
   } catch {}
-  await Promise.race([exited, sleep(5000)]);
+  if (!(await Promise.race([exited.then(() => true), sleep(5000).then(() => false)]))) {
+    // 5 秒还没退出（退出前落盘卡住了）：强杀，免得占着端口。
+    try {
+      process.kill(-app.pid, 'SIGKILL');
+    } catch {}
+    await Promise.race([exited, sleep(2000)]);
+  }
   app = null;
 }
 
@@ -217,10 +227,14 @@ async function startBroken(patch) {
   return { exited, listening, log };
 }
 
+// 测试直连 127.0.0.1，扮演项目前面的反向代理：每个浏览器一个 IP，放在 X-Forwarded-For 最右边（反向代理就是这么加的）。
+let ipSeq = 0;
+const nextIp = () => `100.64.${Math.floor(++ipSeq / 250) % 250}.${ipSeq % 250}`;
 class Browser {
   constructor() {
     this.jar = new Map();
-    this.headers = { 'User-Agent': 'SSO-Conformance/1.0' };
+    this.ip = nextIp();
+    this.headers = { 'User-Agent': 'SSO-Conformance/1.0', 'X-Forwarded-For': this.ip };
   }
   cookieHeader() {
     return [...this.jar].map(([k, v]) => `${k}=${v}`).join('; ');
@@ -259,6 +273,7 @@ class Browser {
   clone() {
     const b = new Browser();
     b.jar = new Map(this.jar);
+    b.ip = this.ip;
     b.headers = { ...this.headers };
     return b;
   }
@@ -688,15 +703,25 @@ try {
     expect((await c.meBody())?.id === me.id, '同一行账号两次登录，用户 ID 不一样');
   });
 
-  await check('账号不存在、密码不对、没填密码：一律 401 且回得一样，真实原因只写进登录日志', async () => {
+  await check('账号不存在、密码不对、没填密码：一律 401 且回得一样，真实原因只写进登录日志；表里没有的账号不记原文（常是把密码填进了账号栏）', async () => {
     const wrong = await new Browser().accountLogin('vendor-test', pw('Wrong'));
-    const unknown = await new Browser().accountLogin('nobody-here', acct.test.password);
+    const nobody = new Browser();
+    const unknown = await nobody.accountLogin('nobody-here', acct.test.password);
     const empty = await new Browser().accountLogin('vendor-test', '');
     expect([wrong, unknown, empty].every((r) => r.status === 401), `应都是 401，实际 ${wrong.status}/${unknown.status}/${empty.status}`);
     const [wb, ub, eb] = [await wrong.text(), await unknown.text(), await empty.text()];
     expect(wb === ub && ub === eb, `几种失败回的不一样，能探出哪些账号存在：${wb} / ${ub} / ${eb}`);
     expect(!wrong.setCookies.some((c) => c.startsWith('__Host-fbif_sid=') && !/max-age=0/i.test(c)), '密码错也下发了会话 cookie');
-    expect(await waitLog((r) => r.事件 === '登录失败' && r.账号 === 'nobody-here' && r.原因 === '账号不存在'), '登录日志里没有「账号不存在」');
+    const miss = await waitLog((r) => r.事件 === '登录失败' && r.IP === nobody.ip && r.原因 === '账号不存在');
+    expect(miss, '登录日志里没有「账号不存在」');
+    expect(miss.账号 && !String(miss.账号).includes('nobody-here'), `表里没有的账号原文进了日志：${miss.账号}`);
+    // 把密码填进了账号栏：日志、待写队列、stderr 里都不能有它。
+    const typedPw = pw('TypedAsName');
+    const typer = new Browser();
+    expect((await typer.accountLogin(typedPw, acct.test.password)).status === 401, '账号栏填密码应 401');
+    const typedRow = await waitLog((r) => r.事件 === '登录失败' && r.IP === typer.ip);
+    expect(typedRow && !JSON.stringify(typedRow).includes(typedPw), `填进账号栏的密码原文进了日志：${JSON.stringify(typedRow)}`);
+    expect(!appLog.includes(typedPw), '填进账号栏的密码原文进了被测项目的 stderr');
     expect(await waitLog((r) => r.事件 === '登录失败' && r.账号 === 'vendor-test' && r.原因 === '密码不对' && r.记录ID === acct.test.id), '登录日志里没有带记录 ID 的「密码不对」');
     await loginOk(acct.test, 'vendor-test');
   });
@@ -910,8 +935,10 @@ try {
     if (featureKey) fsk.removeField(ACCT, featureColumn);
     const wantCodes = ['accounts_column:状态说明', ...(featureKey ? [`feature_column:${featureKey}`] : [])];
     try {
-      // 没有定时巡检：表结构在启动、账号表变更提醒、写不进去的时候查。
+      // 两轮兜底对账之间，表结构在写不进去、变更提醒（最多每分钟一次）、要按读出来的值拒绝或踢人时查：
+      // 这里登录一次，写回「状态说明」写不进去，就查到了。
       await accountsChanged(acct.feature.id);
+      await loginOk(acct.test, 'vendor-test');
       const shown = await eventually(async () => {
         const h = await health();
         return h.status === 503 && h.body?.ok === false && wantCodes.every((c) => h.body.problems.includes(c));
@@ -932,8 +959,9 @@ try {
         fsk.setCell(ACCT, acct.feature.id, featureColumn, true);
       }
     }
-    await accountsChanged(acct.feature.id);
+    // 列有问题时新登录先当场查一次列：列改回来了就照常登录，健康检查也跟着好了。
     const back = await eventually(async () => {
+      await new Browser().accountLogin(acct.test.name, acct.test.password);
       const h = await health();
       return h.status === 200 && !h.body.problems.some((p) => wantCodes.includes(p));
     });
@@ -944,9 +972,10 @@ try {
   await check('账号表查不了（报错、超时）：新登录 503，日志记「查表失败」；登着的人宽限期内照常用；恢复后能登', async () => {
     const online = await loginOk(acct.down);
     const statuses = [];
+    const during = new Browser();
     try {
       fsk.down[ACCT] = 'error';
-      statuses.push((await new Browser().accountLogin(acct.down.name, acct.down.password)).status);
+      statuses.push((await during.accountLogin(acct.down.name, acct.down.password)).status);
       await sleep(CHECK_INTERVAL_MS + 500);
       expect((await online.me()) === 200, '账号表查不了时登着的人被踢了（应有 15 分钟宽限）');
       fsk.down[ACCT] = 'timeout';
@@ -955,7 +984,7 @@ try {
       fsk.down[ACCT] = null;
     }
     expect(statuses.every((x) => x === 503), `账号表报错/超时，新登录应 503，实际 ${statuses.join('/')}`);
-    expect(await waitLog((x) => x.事件 === '登录失败' && x.账号 === acct.down.name && x.原因 === '查表失败'), '日志里没有「查表失败」');
+    expect(await waitLog((x) => x.事件 === '登录失败' && x.IP === during.ip && x.原因 === '查表失败'), '日志里没有「查表失败」');
     expect(await eventually(async () => (await new Browser().accountLogin(acct.down.name, acct.down.password)).status === 200, 15000), '账号表恢复后登不上');
   });
 
@@ -965,13 +994,14 @@ try {
     await eventually(() => logRows().filter((x) => x.事件 === '登录成功' && x.记录ID === acct.test.id).length > okBefore);
     const tagA = logRows().filter((x) => x.事件 === '登录成功' && x.记录ID === acct.test.id).at(-1)?.会话;
     await a.post('/auth/feishu/logout', '{}');
+    // 访客自己写的 X-Forwarded-For 在左边，反向代理把真实地址加在最右边。
     const f = new Browser();
-    f.headers['X-Forwarded-For'] = '203.0.113.7, 10.0.0.1';
+    f.headers['X-Forwarded-For'] = '198.51.100.66, 203.0.113.7';
     await login(f, users.alice, { next: '/after-login' });
     await f.post('/auth/feishu/logout', '{}');
     const r = new Browser();
     r.headers['X-Real-IP'] = '198.51.100.9';
-    r.headers['X-Forwarded-For'] = '203.0.113.8';
+    r.headers['X-Forwarded-For'] = '198.51.100.9, 203.0.113.8';
     await r.accountLogin('nobody-real-ip', pw('Wrong'));
     await sleep(1500);
     const rows = logRows();
@@ -996,14 +1026,18 @@ try {
     need('飞书 登录失败', (x) => x.事件 === '登录失败' && x.登录方式 === '飞书', ['原因', 'IP', 'IP来源', '浏览器']);
     need('飞书 退出', (x) => x.事件 === '退出' && x.登录方式 === '飞书', ['公司', '用户标识', '姓名', '会话']);
     need('飞书 被收回', (x) => x.事件 === '被收回' && x.登录方式 === '飞书', ['原因', '公司', '用户标识', '会话']);
-    const ri = need('X-Real-IP 优先', (x) => x.账号 === 'nobody-real-ip', ['IP', 'IP来源']);
-    expect(ri.IP === '198.51.100.9' && ri.IP来源 === 'X-Real-IP', `有 X-Real-IP 时应记它：${ri.IP} / ${ri.IP来源}`);
+    expect(!rows.some((x) => x.IP === '198.51.100.9' || x.IP === '198.51.100.66'), '记成了访客自己写的 X-Real-IP 或 X-Forwarded-For 左边的地址（能伪造）');
+    const ri = need('认反向代理加的地址', (x) => x.IP === '203.0.113.8' && x.事件 === '登录失败', ['IP', 'IP来源']);
+    expect(ri.IP来源 === 'X-Forwarded-For', `IP 来源应是 X-Forwarded-For：${ri.IP来源}`);
     const wantResult = { 登录: ['成功', '失败'], 退出: ['成功'], 被收回: [undefined], 请求: ['成功', '失败'] };
-    const bad = rows.filter((x) => JSON.stringify(x.项目) !== JSON.stringify([PROJECT_REC]) || !(x.类型 in wantResult) || !wantResult[x.类型].includes(x.结果) || typeof x.次数 !== 'number' || (x.类型 !== '请求' && x.次数 !== 1));
+    const bad = rows.filter((x) => JSON.stringify(x.项目) !== JSON.stringify([PROJECT_REC]) || !(x.类型 in wantResult) || !wantResult[x.类型].includes(x.结果) || typeof x.次数 !== 'number' || x.次数 < 1 || (x.类型 !== '请求' && x.事件 !== '登录失败' && x.次数 !== 1));
     expect(!bad.length, `这些行的项目、类型、结果、次数不对（项目应是 ["${PROJECT_REC}"]）：${JSON.stringify(bad.slice(0, 3))}`);
   });
 
   await check('飞书登录每种失败都记一行「登录失败」并写明原因（缺 state、state 不对、集成平台报错、换令牌失败、租户不对、ID 令牌不对、停用名单、禁止访问）', async () => {
+    // 前面的检查一分钟里造了不少登录失败，登录失败日志每分钟有额度：重启一下从零算。
+    await stopApp();
+    await startApp();
     const count = () => logRows().filter((x) => x.登录方式 === '飞书' && x.事件 === '登录失败' && x.原因).length;
     const scenarios = [
       ['缺 state', () => new Browser().get('/auth/feishu/fbif/callback?code=whatever')],
@@ -1044,9 +1078,11 @@ try {
     try {
       await loginOk(acct.restart, 'VENDOR-RESTART');
       expect(await eventually(async () => (await health()).body?.outbox_pending > 0), '日志写不进去时健康检查的 outbox_pending 不涨');
-      const saved = existsSync(outboxPath) ? readFileSync(outboxPath, 'utf8') : '';
+      // 落盘在后台（不拖慢登录），稍等一下。
+      let saved = '';
+      await eventually(() => (saved = existsSync(outboxPath) ? readFileSync(outboxPath, 'utf8') : '').includes('VENDOR-RESTART'), 3000);
       outboxSnapshots.push(saved);
-      expect(saved.includes('VENDOR-RESTART'), '日志没先落到 SSO_OUTBOX_FILE 就去写了');
+      expect(saved.includes('VENDOR-RESTART'), '日志 3 秒内没落到 SSO_OUTBOX_FILE');
       await stopApp();
       await startApp();
     } finally {
@@ -1067,7 +1103,7 @@ try {
     const q = 'qv' + randomBytes(9).toString('hex');
     secrets.add(q);
     const f = new Browser();
-    f.headers['X-Real-IP'] = '198.51.100.31';
+    f.headers['X-Forwarded-For'] = '198.51.100.31';
     await login(f, users.alice);
     const missing = `/conformance-missing-${tag}`;
     const posted = `/conformance-post-${tag}`;
@@ -1078,7 +1114,7 @@ try {
     want.push(['POST', (x) => x.方法 === 'POST' && x.路径 === posted && x.状态码 === pr.status && x.IP === '198.51.100.31', true]);
     if (plainGet) {
       const anon = new Browser();
-      anon.headers['X-Real-IP'] = '198.51.100.32';
+      anon.headers['X-Forwarded-For'] = '198.51.100.32';
       expect((await anon.get(`${plainGet}?q=${q}`)).status === 401, `没登录访问 ${plainGet} 不是 401`);
       want.push(['401', (x) => x.路径 === plainGet && x.状态码 === 401 && x.原因 === '没登录' && x.结果 === '失败' && x.IP === '198.51.100.32', false]);
     }
@@ -1118,13 +1154,13 @@ try {
     fsk.down[LOGT] = 'timeout';
     try {
       const prime = new Browser();
-      prime.headers['X-Real-IP'] = '198.51.100.40';
+      prime.headers['X-Forwarded-For'] = '198.51.100.40';
       const creates = () => fsk.calls.filter((c) => c.path.endsWith('/records/batch_create')).length;
       const c0 = creates();
       await anonHit(prime);
       expect(await eventually(() => creates() > c0, 5000), '日志表的写入没去试');
       const burst = new Browser();
-      burst.headers['X-Real-IP'] = '198.51.100.41';
+      burst.headers['X-Forwarded-For'] = '198.51.100.41';
       const t0 = Date.now();
       const rs = await Promise.all(Array.from({ length: 50 }, () => anonHit(burst)));
       expect(Date.now() - t0 < 4000, `日志表卡住时 50 个请求用了 ${Date.now() - t0}ms，请求在等日志`);
@@ -1139,12 +1175,14 @@ try {
     expect(rowsFor().length === 1 && rowsFor()[0].次数 === 50, `50 次一样的请求应合成一行、次数 50：${JSON.stringify(rowsFor().map((x) => x.次数))}`);
   });
 
-  await check(`日志表超过 ${LOG_MAX_ROWS} 行（启动时、每写 500 行查一次）：只删最旧的「请求」行，删到 90%；登录、退出、被收回一行不删`, async () => {
+  const isLoginFail = (x) => x.类型 === '登录' && x.结果 === '失败';
+  await check(`日志表超过 ${LOG_MAX_ROWS} 行（启动时、每写 500 行查一次）：删到 90%，先删「登录失败」再删最旧的「请求」行；登录成功、退出、被收回一行不删`, async () => {
     const old = Date.now() - 30 * 86400_000;
     for (let i = 0; i < 50; i++) fsk.addRow(LOGT, { 摘要: '旧登录', 时间: old + i, 项目: ['recOtherProjec01'], 类型: '登录', 结果: '成功', 次数: 1 });
     while (fsk.rows(LOGT).length < LOG_MAX_ROWS + 500) fsk.addRow(LOGT, { 摘要: '旧请求', 时间: old + 100 + fsk.rows(LOGT).length, 项目: ['recOtherProjec01'], 类型: '请求', 结果: '失败', 次数: 1 });
-    const keep = logRows().filter((x) => x.类型 !== '请求').map((x) => x.record_id);
+    const keep = logRows().filter((x) => x.类型 !== '请求' && !isLoginFail(x)).map((x) => x.record_id);
     const reqBefore = requestRows().map((x) => [x.record_id, x.时间]);
+    const t0 = Date.now();
     await stopApp();
     await startApp();
     expect(await eventually(() => fsk.rows(LOGT).length <= LOG_MAX_ROWS * 0.9, 20000), `重启后日志表没删到 ${LOG_MAX_ROWS * 0.9} 行以下：${fsk.rows(LOGT).length}`);
@@ -1154,6 +1192,35 @@ try {
     const gone = reqBefore.filter(([id]) => !now.has(id)).map(([, t]) => t);
     const kept = reqBefore.filter(([id]) => now.has(id)).map(([, t]) => t);
     expect(gone.length > 0 && (!kept.length || Math.max(...gone) <= Math.min(...kept)), '删的不是最旧的请求行');
+    expect(!logRows().some((x) => isLoginFail(x) && x.时间 < t0), '还留着「登录失败」却先删了「请求」行');
+  });
+
+  await check('日志表被删不掉的行塞满也不卡死：只剩「登录失败」和登录成功等行时先删最旧的「登录失败」，还不够就删最旧的别的行，删完照常写', async () => {
+    const old = Date.now() - 20 * 86400_000;
+    for (const id of requestRows().map((x) => x.record_id)) fsk.deleteRow(LOGT, id);
+    while (fsk.rows(LOGT).length < LOG_MAX_ROWS + 300) fsk.addRow(LOGT, { 摘要: '旧登录失败', 时间: old + fsk.rows(LOGT).length, 项目: ['recOtherProjec01'], 类型: '登录', 结果: '失败', 次数: 1 });
+    const keep = logRows().filter((x) => !isLoginFail(x)).map((x) => x.record_id);
+    const failsBefore = logRows().filter(isLoginFail).map((x) => [x.record_id, x.时间]);
+    await stopApp();
+    await startApp();
+    expect(await eventually(() => fsk.rows(LOGT).length <= LOG_MAX_ROWS * 0.9, 20000), `只剩登录类的行时没删到 ${LOG_MAX_ROWS * 0.9} 行以下：${fsk.rows(LOGT).length}`);
+    const now = new Set(fsk.rows(LOGT).map((r) => r.record_id));
+    expect(keep.every((id) => now.has(id)), '还有「登录失败」可删却删了登录成功、退出或被收回');
+    const gone = failsBefore.filter(([id]) => !now.has(id)).map(([, t]) => t);
+    const kept = failsBefore.filter(([id]) => now.has(id)).map(([, t]) => t);
+    expect(gone.length > 0 && (!kept.length || Math.max(...gone) <= Math.min(...kept)), '删的不是最旧的「登录失败」');
+    // 再塞成全是登录成功：只能删它们，删最旧的。
+    for (const id of logRows().filter(isLoginFail).map((x) => x.record_id)) fsk.deleteRow(LOGT, id);
+    while (fsk.rows(LOGT).length < LOG_MAX_ROWS + 300) fsk.addRow(LOGT, { 摘要: '旧登录', 时间: old - 86400_000 + fsk.rows(LOGT).length, 项目: ['recOtherProjec01'], 类型: '登录', 结果: '成功', 次数: 1 });
+    const newest = logRows().filter((x) => x.摘要 !== '旧登录').map((x) => x.record_id);
+    await stopApp();
+    await startApp();
+    expect(await eventually(() => fsk.rows(LOGT).length <= LOG_MAX_ROWS * 0.9, 20000), `全是登录成功时表没删下来（会被塞满写不进去）：${fsk.rows(LOGT).length}`);
+    const left = new Set(fsk.rows(LOGT).map((r) => r.record_id));
+    expect(newest.every((id) => left.has(id)), '删的不是最旧的行');
+    const b = await loginOk(acct.test, 'vendor-test');
+    await b.post('/auth/feishu/logout', '{}');
+    expect(await eventually(() => logRows().some((x) => x.事件 === '退出' && x.登录方式 === '账号密码' && Date.now() - x.时间 < 60_000), 15000), '删完之后新的日志没写进去');
   });
 
   // 「几秒内」是相对兜底对账的间隔说的：变更提醒那条已经证明提醒到了不等核对周期。
@@ -1237,7 +1304,7 @@ try {
       await Promise.all(Array.from({ length: Math.min(20, 260 - start) }, (_, k) => {
         const i = start + k;
         const b = new Browser();
-        b.headers['X-Real-IP'] = `198.18.${Math.floor(i / 200)}.${i % 200}`;
+        b.headers['X-Forwarded-For'] = `198.18.${Math.floor(i / 200)}.${i % 200}`;
         return anonHit(b);
       }));
     }
@@ -1246,6 +1313,148 @@ try {
     expect(added <= 200 && added >= 150, `一分钟里 260 个不同的人各打一次，应记 150～200 行：${added}`);
     const h = await health();
     expect(h.status === 200 && h.body?.ok === true && h.body.dropped_request_rows >= 60 && h.body.problems.includes('warn_request_rows_dropped'), `健康检查应 ok、dropped_request_rows ≥ 60、带 warn_request_rows_dropped：${h.text}`);
+  });
+
+  // 只数登录时按账号的查询；兜底对账的整表读（启动那一轮可能还没跑完）不算。
+  const searches = () => fsk.calls.filter((c) => c.path.endsWith(`/tables/${ACCT}/records/search`) && !c.full).length;
+  const sum = (rows) => rows.reduce((n, r) => n + (r.次数 ?? 0), 0);
+
+  await check('账号表的列被改了名（「账号状态」）：读回来的空值不当真，登着的人不被收回、新登录 503、健康检查报这一列、「状态」不乱写；改回来就好了', async () => {
+    const online = await loginOk(acct.col);
+    fsk.renameField(ACCT, '账号状态', '账号状态（改）');
+    try {
+      // 过了核对周期：按记录 ID 读到的这一行没有「账号状态」。
+      await sleep(CHECK_INTERVAL_MS + 500);
+      const meStatus = await online.me();
+      await accountsChanged(acct.col.id);
+      await sleep(1500);
+      const again = await new Browser().accountLogin(acct.col.name, acct.col.password);
+      const h = await health();
+      expect(meStatus === 200 && (await online.me()) === 200, `列改了名，登着的人被收回了：HTTP ${meStatus}`);
+      expect(again.status === 503, `列改了名，新登录应 503，实际 HTTP ${again.status}`);
+      expect(h.status === 503 && h.body?.problems.includes('accounts_column:账号状态'), `健康检查没报 accounts_column:账号状态：${h.text}`);
+      expect(!logRows().some((x) => x.事件 === '被收回' && x.记录ID === acct.col.id), '列改了名却记了「被收回」');
+      expect(fsk.row(ACCT, acct.col.id).状态 === '正常', `列改了名，把「状态」写成了 ${fsk.row(ACCT, acct.col.id).状态}`);
+    } finally {
+      fsk.renameField(ACCT, '账号状态（改）', '账号状态');
+    }
+    expect(await eventually(async () => (await new Browser().accountLogin(acct.col.name, acct.col.password)).status === 200, 15000), '列改回来后登不上');
+    expect((await online.me()) === 200, '列改回来后登着的人被收回了');
+    expect(await eventually(async () => (await health()).status === 200, 15000), `列改回来后健康检查没好：${(await health()).text}`);
+  });
+
+  await check('同一账号同时猜 50 次密码：最多 5 次真去查表、记连错，其余 429；凑满 5 次后密码对了也 429', async () => {
+    const before = searches();
+    fsk.latency[ACCT] = 300;
+    let rs;
+    try {
+      rs = await Promise.all(Array.from({ length: 50 }, () => new Browser().accountLogin(acct.race.name, pw('Guess'))));
+    } finally {
+      fsk.latency[ACCT] = 0;
+    }
+    const looked = searches() - before;
+    const codes = rs.map((r) => r.status);
+    expect(looked <= 5, `同时 50 次错密码查了 ${looked} 次表（最多 5 次）`);
+    expect(codes.filter((c) => c === 401).length <= 5 && codes.filter((c) => c === 429).length >= 45, `应最多 5 个 401、其余 429：${codes.join(',')}`);
+    const ok = await new Browser().accountLogin(acct.race.name, acct.race.password);
+    expect(ok.status === 429, `凑满 5 次后密码对了返回 HTTP ${ok.status}，应 429`);
+    expect(await eventually(() => fsk.row(ACCT, acct.race.id).状态 === '已锁定'), `表里没写「已锁定」：${fsk.row(ACCT, acct.race.id).状态}`);
+  });
+
+  await check('不用登录就能刷的登录失败（不带 state 的回调 200 次、被锁的账号 35 次）：一样的合成一行记「次数」，日志表只多几行，次数一次不少', async () => {
+    // 重启一下，这一分钟的额度从零算。
+    await stopApp();
+    await startApp();
+    const x = new Browser();
+    const before = new Set(logRows().map((r) => r.record_id));
+    // 每批隔半秒，够假飞书把上一批写出去：没有 10 秒窗口的实现每批都新起一行；有窗口的 5 秒内跑完只有两行。
+    for (let i = 0; i < 10; i++) {
+      await Promise.all(Array.from({ length: 20 }, () => x.get('/auth/feishu/fbif/callback?code=whatever')));
+      await sleep(500);
+    }
+    for (let i = 0; i < 5; i++) await x.accountLogin(acct.flood.name, pw('Wrong'));
+    for (let i = 0; i < 30; i++) await x.accountLogin(acct.flood.name, acct.flood.password);
+    expect(await eventually(async () => (await health()).body?.outbox_pending === 0, 30000), '30 秒内日志没写完');
+    const rows = logRows().filter((r) => !before.has(r.record_id) && r.IP === x.ip);
+    const noState = rows.filter((r) => r.登录方式 === '飞书');
+    expect(rows.length <= 15, `一个 IP 刷了 235 次登录失败，日志表多了 ${rows.length} 行（一样的应合成一行）`);
+    expect(noState.length <= 3 && sum(noState) === 200, `200 次不带 state 的回调应合成 3 行以内、次数加起来 200：${noState.length} 行，次数 ${sum(noState)}`);
+    expect(rows.some((r) => r.次数 > 1 && r.账号 === acct.flood.name), '被锁账号的重复尝试没合成一行记次数');
+    expect(sum(rows) === 235, `次数加起来应是 235：${sum(rows)}`);
+  });
+
+  await check('账号密码登录限速：同一个 IP 一分钟最多 10 次、整个进程一分钟最多查 60 次账号表，超了 429；登录失败日志一分钟最多新增 30 行，健康检查看得到丢了多少', async () => {
+    await stopApp();
+    const t0 = Date.now();
+    await startApp();
+    const s0 = searches();
+    const y = new Browser();
+    const ys = [];
+    for (let i = 0; i < 15; i++) ys.push((await y.accountLogin(`nobody-ip-${i}`, pw('Wrong'))).status);
+    expect(searches() - s0 <= 10, `同一个 IP 15 次登录查了 ${searches() - s0} 次表（最多 10 次）`);
+    expect(ys.filter((c) => c === 429).length >= 5, `同一个 IP 第 11 次起应 429：${ys.join(',')}`);
+    const rs = [];
+    for (let start = 0; start < 80; start += 20) rs.push(...(await Promise.all(Array.from({ length: 20 }, (_, k) => new Browser().accountLogin(`nobody-many-${start + k}`, pw('Wrong'))))));
+    const looked = searches() - s0;
+    expect(looked <= 60, `一分钟里查了 ${looked} 次账号表（最多 60 次）`);
+    expect(rs.filter((r) => r.status === 429).length >= 30, `查表次数用完后应 429：${rs.map((r) => r.status).join(',')}`);
+    expect(await eventually(async () => (await health()).body?.outbox_pending === 0, 30000), '30 秒内日志没写完');
+    const added = logRows().filter((r) => r.事件 === '登录失败' && r.时间 >= t0);
+    expect(added.length <= 30, `一分钟里新增了 ${added.length} 行登录失败（最多 30 行）`);
+    const h = await health();
+    expect(h.status === 200 && h.body?.dropped_login_rows > 0 && h.body.problems.includes('warn_login_rows_dropped'), `健康检查应 ok、dropped_login_rows > 0、带 warn_login_rows_dropped：${h.text}`);
+  });
+
+  await check('账号表变更提醒被人狂发（60 个乱给的记录 ID，每个同时发两遍，发 10 轮）：一分钟里去查飞书多维表格的次数有上限', async () => {
+    await stopApp();
+    await startApp();
+    await sleep(2000);
+    const c0 = fsk.calls.length;
+    const ids = Array.from({ length: 60 }, (_, i) => `recFlood${String(i).padStart(4, '0')}x`);
+    fsk.latency[ACCT] = 100;
+    try {
+      for (let round = 0; round < 10; round++) {
+        for (let start = 0; start < ids.length; start += 20) await Promise.all(ids.slice(start, start + 20).flatMap((id) => [accountsChanged(id), accountsChanged(id)]));
+        await sleep(200);
+      }
+      await sleep(3000);
+    } finally {
+      fsk.latency[ACCT] = 0;
+    }
+    const calls = fsk.calls.slice(c0).filter((c) => c.path.includes('/bitable/'));
+    expect(calls.length <= 70, `狂发变更提醒，一分钟里调了 ${calls.length} 次多维表格接口（60 次处理、表结构最多查一次，应在 70 次以内）`);
+  });
+
+  await check('待写队列落盘卡住（磁盘很慢、挂住了）也不拖慢登录：登录照样马上 200，健康检查照常回', async () => {
+    // 模板落盘是先写 SSO_OUTBOX_FILE.tmp 再改名：把 .tmp 换成没人读的命名管道，打开它写就会一直卡着。
+    const tmp = outboxPath + '.tmp';
+    rmSync(tmp, { force: true });
+    execFileSync('mkfifo', [tmp]);
+    let drain = null;
+    try {
+      await loginOk(acct.test, 'vendor-test');
+      await sleep(500);
+      const t0 = Date.now();
+      const r = await new Browser().request(base + '/auth/account/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: acct.test.name, password: acct.test.password }), signal: AbortSignal.timeout(5000) }).catch((e) => ({ status: `没回（${e.name}）` }));
+      const took = Date.now() - t0;
+      const h = await fetch(base + '/internal/auth/health', { signal: AbortSignal.timeout(5000) }).then((x) => x.status).catch(() => '没回');
+      expect(r.status === 200 && took < 3000, `落盘卡住时登录 ${took} 毫秒、HTTP ${r.status}（应马上 200）`);
+      expect(h === 200 || h === 503, `落盘卡住时健康检查没回：${h}`);
+    } finally {
+      // 有人读管道，卡着的那次写就能写完；之后删掉管道，下一次落盘照常写文件。
+      drain = spawn('sh', ['-c', 'while [ -p "$0" ]; do cat "$0" >/dev/null; done', tmp], { stdio: 'ignore', detached: true });
+      await sleep(1000);
+      rmSync(tmp, { force: true });
+      await sleep(500);
+      try {
+        process.kill(-drain.pid, 'SIGKILL');
+      } catch {}
+    }
+    await loginOk(acct.test, 'vendor-test');
+    expect(await eventually(() => existsSync(outboxPath) && lstatSync(outboxPath).isFile() && readFileSync(outboxPath, 'utf8').startsWith('['), 10000), '管道拿掉之后待写队列没再正常落盘');
+    expect(await eventually(async () => (await health()).body?.outbox_pending === 0, 30000), '管道拿掉之后积压没清空');
+    await stopApp();
+    await startApp();
   });
 
   await check('登录日志、待写队列文件、健康检查里没有密码、令牌、授权码、state、cookie', async () => {
